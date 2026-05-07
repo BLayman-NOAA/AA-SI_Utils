@@ -1,0 +1,139 @@
+# =============================================================================
+# PRE-COMMIT CONFIGURATION
+# =============================================================================
+#
+# Pre-commit hooks run automatically before each commit to catch issues early.
+# This helps maintain code quality and prevents committing secrets or bad code.
+#
+# SETUP (one-time):
+#   1. Install pre-commit: pip install pre-commit
+#   2. Install the hooks: pre-commit install
+#
+# USAGE:
+#   - Hooks run automatically on `git commit`
+#   - Run manually on all files: pre-commit run --all-files
+#   - Update hooks to latest versions: pre-commit autoupdate
+#   - Skip hooks temporarily: git commit --no-verify (use sparingly!)
+#
+# For more information: https://pre-commit.com/
+#
+# =============================================================================
+
+# Minimum pre-commit version required
+minimum_pre_commit_version: "3.0.0"
+
+# Set default settings for all hooks
+default_language_version:
+  python: python3.12
+
+repos:
+  # ---------------------------------------------------------------------------
+  # General file checks
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # Prevent large files from being committed
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+
+      # Check for files that would conflict on case-insensitive filesystems
+      - id: check-case-conflict
+
+      # Check for merge conflict markers
+      - id: check-merge-conflict
+
+      # Ensure files end with a newline
+      - id: end-of-file-fixer
+
+      # Remove trailing whitespace
+      - id: trailing-whitespace
+
+      # Check YAML file syntax
+      - id: check-yaml
+
+      # Check TOML file syntax
+      - id: check-toml
+
+      # Check JSON file syntax
+      - id: check-json
+        exclude: '.vscode/'
+
+      # Validate Python AST (syntax check)
+      - id: check-ast
+
+      # Check for debugger imports and breakpoints
+      - id: debug-statements
+
+  # ---------------------------------------------------------------------------
+  # Python Code Formatting - Black
+  # ---------------------------------------------------------------------------
+  # Black is an opinionated code formatter that enforces a consistent style
+  # Configuration is in pyproject.toml under [tool.black]
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        language_version: python3.12
+
+  # ---------------------------------------------------------------------------
+  # Import Sorting - isort
+  # ---------------------------------------------------------------------------
+  # isort sorts and organizes imports automatically
+  # Configured to be compatible with Black
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+
+  # ---------------------------------------------------------------------------
+  # Python Linting - Pylint
+  # ---------------------------------------------------------------------------
+  # Pylint performs static code analysis to find errors and enforce standards
+  # Configuration is in .pylintrc and pyproject.toml
+  - repo: local
+    hooks:
+      - id: pylint
+        name: pylint
+        entry: pylint
+        language: system
+        types: [python]
+        args:
+          - "--rcfile=.pylintrc"
+          # Only check for errors and warnings, not conventions (faster)
+          # Remove this line for full linting
+          - "--errors-only"
+
+  # ---------------------------------------------------------------------------
+  # Secret Detection - Gitleaks
+  # ---------------------------------------------------------------------------
+  # Gitleaks scans for hardcoded secrets, API keys, passwords, etc.
+  # CRITICAL: Prevents accidentally committing sensitive information
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  # ---------------------------------------------------------------------------
+  # Security Linting - Bandit (Optional)
+  # ---------------------------------------------------------------------------
+  # Bandit finds common security issues in Python code
+  # Uncomment to enable security scanning
+  # - repo: https://github.com/PyCQA/bandit
+  #   rev: 1.7.10
+  #   hooks:
+  #     - id: bandit
+  #       args: ["-c", "pyproject.toml"]
+  #       additional_dependencies: ["bandit[toml]"]
+
+  # ---------------------------------------------------------------------------
+  # Type Checking - MyPy (Optional)
+  # ---------------------------------------------------------------------------
+  # MyPy performs static type checking based on type hints
+  # Uncomment to enable type checking
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.13.0
+  #   hooks:
+  #     - id: mypy
+  #       additional_dependencies: []  # Add type stubs as needed

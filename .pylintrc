@@ -1,0 +1,83 @@
+# =============================================================================
+# PYLINTRC - Pylint Configuration File
+# =============================================================================
+#
+# This file configures Pylint, a static code analysis tool for Python.
+# Pylint checks for errors, enforces coding standards, and looks for code smells.
+#
+# USAGE:
+#   - Run pylint manually: pylint src/aa_si_utils
+#   - Pylint runs automatically via pre-commit hooks (see .pre-commit-config.yaml)
+#   - Most IDEs (VS Code, PyCharm) can use this file for real-time linting
+#
+# CUSTOMIZATION:
+#   - Add rules to [MESSAGES CONTROL] disable= to ignore specific warnings
+#   - Adjust max-line-length if your team prefers a different limit
+#   - See https://pylint.pycqa.org/en/latest/technical_reference/features.html
+#     for all available options
+#
+# NOTE: Basic pylint settings are also defined in pyproject.toml under [tool.pylint].
+#       This file can be used for more advanced configuration if needed.
+#       Settings in pyproject.toml take precedence for overlapping options.
+#
+# =============================================================================
+
+[MAIN]
+# Specify a score threshold under which the program will exit with error.
+fail-under=8.0
+
+# Use multiple processes to speed up Pylint. 0 = auto-detect number of CPUs.
+jobs=0
+
+# Pickle collected data for later comparisons.
+persistent=yes
+
+[MESSAGES CONTROL]
+# Disable specific messages. Add message codes here to suppress warnings.
+# Example: disable=C0114,C0115,C0116 (missing docstrings)
+#
+# Common codes to consider disabling:
+#   C0114: missing-module-docstring
+#   C0115: missing-class-docstring
+#   C0116: missing-function-docstring
+#   W0511: fixme (TODO/FIXME comments)
+#   R0903: too-few-public-methods
+#
+# Uncomment below to disable specific messages:
+# disable=
+
+[FORMAT]
+# Maximum number of characters on a single line (matches Black default)
+max-line-length=88
+
+# Maximum number of lines in a module
+max-module-lines=1000
+
+[DESIGN]
+# Maximum number of arguments for function / method
+max-args=7
+
+# Maximum number of attributes for a class
+max-attributes=10
+
+# Maximum number of public methods for a class
+max-public-methods=20
+
+[SIMILARITIES]
+# Minimum lines number of a similarity (for duplicate code detection)
+min-similarity-lines=4
+
+# Ignore comments when computing similarities
+ignore-comments=yes
+
+# Ignore docstrings when computing similarities
+ignore-docstrings=yes
+
+[TYPECHECK]
+# List of module names for which member attributes should not be checked
+# Useful for dynamically generated attributes
+ignored-modules=
+
+[IMPORTS]
+# Allow wildcard imports from specific modules (generally discouraged)
+allow-wildcard-with-all=no
