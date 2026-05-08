@@ -42,7 +42,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/nmfs-ost/AA-SI_Utils.git
+git clone https://github.com/BLayman-NOAA/AA-SI_Utils.git
 cd AA-SI_Utils
 
 # Create a virtual environment

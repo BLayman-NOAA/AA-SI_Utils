@@ -60,11 +60,11 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/nmfs-ost/AA-SI_Utils"
-Documentation = "https://nmfs-ost.github.io/AA-SI_Utils/"
-Repository = "https://github.com/nmfs-ost/AA-SI_Utils.git"
-Issues = "https://github.com/nmfs-ost/AA-SI_Utils/issues"
-Changelog = "https://github.com/nmfs-ost/AA-SI_Utils/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/BLayman-NOAA/AA-SI_Utils"
+Documentation = "https://BLayman-NOAA.github.io/AA-SI_Utils/"
+Repository = "https://github.com/BLayman-NOAA/AA-SI_Utils.git"
+Issues = "https://github.com/BLayman-NOAA/AA-SI_Utils/issues"
+Changelog = "https://github.com/BLayman-NOAA/AA-SI_Utils/blob/main/CHANGELOG.md"
 
 # =============================================================================
 # Tool Configuration
