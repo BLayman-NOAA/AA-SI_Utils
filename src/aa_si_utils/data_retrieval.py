@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: NOAA Fisheries
 """Functions for querying and downloading NOAA NCEI water column sonar data."""
 
+import hashlib
+import json
+import os
 import re
 import tarfile
 from datetime import datetime
@@ -50,6 +53,179 @@ def _validate_string_value(value, param_name):
                 f"Parameter '{param_name}' contains forbidden character sequence "
                 f"'{ch}'. Please remove it to avoid query injection."
             )
+
+
+# Query label helpers
+
+_LABEL_MAX_LEN = 40
+_LABEL_TRUNC_LEN = 30
+_LABEL_SAFE_RE = re.compile(r"[^A-Za-z0-9_.\-]+")
+
+
+def _slug(value):
+    """Sanitize a value for use in a folder name."""
+    if value is None:
+        return ""
+    return _LABEL_SAFE_RE.sub("_", str(value)).strip("_")
+
+
+def _safe_subfolder_name(value, fallback="downloads"):
+    """Return a folder-safe single path component."""
+    name = _slug(value) or fallback
+    if name in {".", ".."}:
+        return fallback
+    return name
+
+
+def _compress_iso_datetime(value):
+    """Render an ISO datetime as ``YYYY-MM-DD_HHMM`` (or date only if no time)."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return _slug(value)
+    else:
+        dt = value
+    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        return dt.strftime("%Y-%m-%d")
+    return dt.strftime("%Y-%m-%d_%H%M")
+
+
+def build_query_label(
+    dataset_name=None,
+    instrument_type=None,
+    frequencies=None,
+    calibration_state=None,
+    collection_start=None,
+    collection_end=None,
+    file_time_start=None,
+    file_time_end=None,
+    max_files=None,
+    bbox=None,
+    center_point=None,
+    radius_nm=None,
+    filters=None,
+    max_len=_LABEL_MAX_LEN,
+    **extra_params,
+):
+    """Build a readable per-query folder name from query parameters.
+
+    The label encodes the most identifying parameters (cruise/dataset, date
+    range, then frequencies/bbox/instrument) joined with underscores. If the
+    composed label exceeds *max_len* characters, it is truncated to
+    ``_LABEL_TRUNC_LEN`` characters and a short hash of the full parameter set
+    is appended for uniqueness.
+
+    Accepts and ignores extra keyword arguments so callers can pass the
+    full query parameter dict directly.
+
+    Returns:
+        str: A folder-safe label, never empty. Falls back to
+        ``"query_<8-char-hash>"`` if no identifying parameters are supplied.
+    """
+    parts = []
+
+    cruise = None
+    if filters:
+        cruise = filters.get("CRUISE_NAME") or filters.get("DATASET_NAME")
+    cruise = cruise or dataset_name
+    if cruise:
+        parts.append(_slug(cruise))
+
+    start_s = _compress_iso_datetime(file_time_start)
+    end_s = _compress_iso_datetime(file_time_end)
+    if not start_s and not end_s:
+        start_s = _compress_iso_datetime(collection_start)
+        end_s = _compress_iso_datetime(collection_end)
+    if start_s and end_s:
+        # If both share the same date, collapse to date + start-end times
+        if (
+            len(start_s) > 10
+            and len(end_s) > 10
+            and start_s[:10] == end_s[:10]
+        ):
+            parts.append(f"{start_s}-{end_s[11:]}")
+        else:
+            parts.append(f"{start_s}_to_{end_s}")
+    elif start_s:
+        parts.append(f"from_{start_s}")
+    elif end_s:
+        parts.append(f"to_{end_s}")
+
+    if frequencies:
+        freqs = "-".join(_slug(f) for f in frequencies)
+        if freqs:
+            parts.append(freqs)
+
+    if calibration_state is not None:
+        if isinstance(calibration_state, (list, tuple)):
+            cal_value = "-".join(_slug(v) for v in calibration_state)
+        else:
+            cal_value = _slug(calibration_state)
+        if cal_value:
+            parts.append(f"cal_{cal_value}")
+
+    if filters:
+        for key in sorted(filters):
+            if key in {"CRUISE_NAME", "DATASET_NAME"}:
+                continue
+            filter_label = _slug(f"{key}_{filters[key]}")
+            if filter_label:
+                parts.append(filter_label)
+
+    if instrument_type and not cruise:
+        parts.append(_slug(instrument_type))
+
+    if bbox:
+        try:
+            west, south, east, north = bbox
+            parts.append(
+                f"bbox_{west:g}_{south:g}_{east:g}_{north:g}".replace(".", "p")
+            )
+        except (TypeError, ValueError):
+            pass
+    elif center_point is not None and radius_nm is not None:
+        try:
+            lon, lat = center_point
+            parts.append(
+                f"pt_{lon:g}_{lat:g}_r{radius_nm:g}".replace(".", "p")
+            )
+        except (TypeError, ValueError):
+            pass
+
+    if max_files is not None:
+        parts.append(f"max_{_slug(max_files)}")
+
+    label = "_".join(p for p in parts if p) or "query"
+
+    extra_for_hash = {k: v for k, v in extra_params.items() if v is not None}
+    if len(label) <= max_len and not extra_for_hash:
+        return label
+
+    # Build a deterministic hash from the full parameter set
+    payload = {
+        "dataset_name": dataset_name,
+        "instrument_type": instrument_type,
+        "frequencies": frequencies,
+        "calibration_state": calibration_state,
+        "collection_start": str(collection_start) if collection_start else None,
+        "collection_end": str(collection_end) if collection_end else None,
+        "file_time_start": str(file_time_start) if file_time_start else None,
+        "file_time_end": str(file_time_end) if file_time_end else None,
+        "max_files": max_files,
+        "bbox": bbox,
+        "center_point": center_point,
+        "radius_nm": radius_nm,
+        "filters": filters,
+        "extra_params": extra_for_hash,
+    }
+    digest = hashlib.sha1(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:8]
+    trunc = label[:_LABEL_TRUNC_LEN].rstrip("_-.")
+    return f"{trunc}_{digest}"
 
 
 def _build_where_clause(
@@ -245,6 +421,8 @@ def _download_companions(primary_url, primary_dest, output_dir, extensions, over
             with open(comp_dest, "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
                     fh.write(chunk)
+                fh.flush()
+                os.fsync(fh.fileno())
 
             size_mb = comp_dest.stat().st_size / (1024 * 1024)
             print(f"           Companion ({size_mb:.1f} MB): {comp_dest.name}")
@@ -313,13 +491,18 @@ def query_ncei_data(
             ``{'CRUISE_NAME': 'DY2207', 'PLATFORM_NAME': 'Oscar Dyson (DY)'}``).
 
     Returns:
-        list[dict]: A list of result dictionaries, one per file.  Each dict
-        contains all WCSD attribute fields plus a ``FILE_DATETIME``
-        (``datetime`` or ``None``) parsed from the filename.
+        dict: A dict with two keys:
+
+            - ``records`` (``list[dict]``): One entry per file. Each dict
+              contains all WCSD attribute fields plus a ``FILE_DATETIME``
+              (``datetime`` or ``None``) parsed from the filename.
+            - ``query_label`` (``str``): A readable, folder-safe slug derived
+              from the query parameters (see :func:`build_query_label`).
+              Useful for grouping downloads into per-query subfolders.
 
     Example::
 
-        results = query_ncei_data(
+        result = query_ncei_data(
             dataset_name="DY2207_EK80",
             frequencies=["38WKHZ", "120WKHZ"],
             collection_start="2022-06-04",
@@ -327,7 +510,25 @@ def query_ncei_data(
             file_time_start="2022-06-04T08:00:00",
             file_time_end="2022-06-04T10:00:00",
         )
+        records = result["records"]
+        label = result["query_label"]
     """
+    query_label = build_query_label(
+        dataset_name=dataset_name,
+        instrument_type=instrument_type,
+        frequencies=frequencies,
+        calibration_state=calibration_state,
+        collection_start=collection_start,
+        collection_end=collection_end,
+        file_time_start=file_time_start,
+        file_time_end=file_time_end,
+        max_files=max_files,
+        bbox=bbox,
+        center_point=center_point,
+        radius_nm=radius_nm,
+        filters=filters,
+    )
+
     # Auto-derive collection date range from file_time if not given
     if file_time_start is not None and collection_start is None:
         ft_start = (
@@ -372,7 +573,7 @@ def query_ncei_data(
         items = _fetch_all_pages(params)
     except requests.exceptions.RequestException as exc:
         print(f"Network error: {exc}")
-        return []
+        return {"records": [], "query_label": query_label}
 
     # Enrich with FILE_DATETIME
     for item in items:
@@ -413,47 +614,86 @@ def query_ncei_data(
     if max_files is not None:
         items = items[:max_files]
 
-    print(f"Query returned {len(items)} result(s).")
-    return items
+    print(f"Query returned {len(items)} result(s). Label: {query_label}")
+    return {"records": items, "query_label": query_label}
 
 
-def download_ncei_data(results, output_dir, overwrite=False, companion_extensions=None):
+def download_ncei_data(
+    results,
+    output_dir,
+    overwrite=False,
+    companion_extensions=None,
+    query_id=None,
+    query_label=None,
+):
     """Download files returned by :func:`query_ncei_data`.
 
+    Each invocation writes into a per-query subfolder under *output_dir*:
+    ``output_dir / (query_id or query_label or "downloads")``. This isolates
+    the files belonging to each query so that re-running with different
+    parameters does not mix results, and re-running with the same parameters
+    reuses the same folder (already-present files are skipped).
+
     Converts each result's ``CLOUD_PATH`` (an S3 URI) to a public HTTPS URL
-    and streams the file to *output_dir*.  ``.tar`` archives are automatically
-    extracted into a subfolder and the archive is removed.
+    and streams the file to the per-query subfolder. ``.tar`` archives are
+    automatically extracted into a sibling subfolder and the archive is
+    removed.
 
     Args:
-        results (list[dict]): Output from :func:`query_ncei_data`.
-        output_dir (str | Path): Local directory to save downloaded files.
+        results: Either the dict returned by :func:`query_ncei_data` (with
+            ``records`` and ``query_label`` keys) or a bare ``list[dict]`` of
+            records.
+        output_dir (str | Path): Local *base* directory. The actual files are
+            written into ``output_dir / <subfolder_name>/``.
         overwrite (bool): If ``False`` (default), skip files that already
-            exist in *output_dir*.
+            exist in the per-query subfolder.
         companion_extensions (list[str] | None): Additional file extensions to
-            download alongside each result.  For example,
-            ``[".bot", ".idx"]`` will attempt to download companion files that
-            share the same base name but have these extensions.  Missing
-            companions (HTTP 404) are silently skipped.
+            download alongside each result, e.g. ``[".bot", ".idx"]``.
+        query_id (str | None): Explicit subfolder name. Overrides
+            ``query_label``. Sanitized for filesystem safety.
+        query_label (str | None): Fallback subfolder name when ``query_id`` is
+            not given and ``results`` is a bare list. Ignored when ``results``
+            is a dict (its embedded ``query_label`` is used).
 
     Returns:
-        list[Path]: Paths to all downloaded (or extracted) files.
+        dict: ``{"downloaded_paths": list[Path], "download_dir": Path}`` where
+        ``download_dir`` is the resolved per-query subfolder.
 
     Example::
 
-        results = query_ncei_data(dataset_name="DY2207_EK80", max_files=3)
-        paths = download_ncei_data(
-            results,
+        result = query_ncei_data(dataset_name="DY2207_EK80", max_files=3)
+        out = download_ncei_data(
+            result,
             output_dir="./downloads",
             companion_extensions=[".bot", ".idx"],
         )
+        files = out["downloaded_paths"]
+        folder = out["download_dir"]
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Accept either the new dict shape or a bare list for backwards friendliness
+    if isinstance(results, dict):
+        embedded_label = results.get("query_label")
+        records = results.get("records", [])
+    else:
+        embedded_label = None
+        records = list(results) if results is not None else []
+
+    base_dir = Path(output_dir)
+    subfolder_name = query_id or embedded_label or query_label or "downloads"
+    subfolder_name = _safe_subfolder_name(subfolder_name)
+    download_dir = base_dir / subfolder_name
+    try:
+        download_dir.resolve().relative_to(base_dir.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            "query_id/query_label must resolve to a subfolder under output_dir"
+        ) from exc
+    download_dir.mkdir(parents=True, exist_ok=True)
 
     all_paths = []
-    total = len(results)
+    total = len(records)
 
-    for idx, item in enumerate(results, start=1):
+    for idx, item in enumerate(records, start=1):
         cloud_path = item.get("CLOUD_PATH")
         if not cloud_path:
             print(f"  [{idx}/{total}] Skipping result with no CLOUD_PATH.")
@@ -478,20 +718,22 @@ def download_ncei_data(results, output_dir, overwrite=False, companion_extension
                 filename += ".tar"
                 url += ".tar"
 
-        dest = output_dir / filename
+        dest = download_dir / filename
 
         # Check for already-extracted directory (tar case)
-        extracted_dir = output_dir / Path(filename).stem
+        extracted_dir = download_dir / Path(filename).stem
         if not overwrite and dest.exists():
             print(f"  [{idx}/{total}] Already exists, skipping: {filename}")
             all_paths.append(dest)
             # Still check companions even when main file exists
             if companion_extensions:
                 all_paths.extend(
-                    _download_companions(url, dest, output_dir, companion_extensions, overwrite)
+                    _download_companions(
+                        url, dest, download_dir, companion_extensions, overwrite
+                    )
                 )
             continue
-        if not overwrite and extracted_dir.is_dir():
+        if not overwrite and extracted_dir.is_dir() and any(extracted_dir.iterdir()):
             print(f"  [{idx}/{total}] Already extracted, skipping: {extracted_dir.name}/")
             existing = list(extracted_dir.rglob("*"))
             all_paths.extend(p for p in existing if p.is_file())
@@ -505,6 +747,8 @@ def download_ncei_data(results, output_dir, overwrite=False, companion_extension
         with open(dest, "wb") as fh:
             for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
                 fh.write(chunk)
+            fh.flush()
+            os.fsync(fh.fileno())
 
         size_mb = dest.stat().st_size / (1024 * 1024)
         print(f"           Saved ({size_mb:.1f} MB): {dest.name}")
@@ -512,7 +756,7 @@ def download_ncei_data(results, output_dir, overwrite=False, companion_extension
         # Auto-extract tar archives
         if dest.suffix == ".tar" or tarfile.is_tarfile(dest):
             try:
-                extracted = _extract_tar(dest, output_dir)
+                extracted = _extract_tar(dest, download_dir)
                 all_paths.extend(extracted)
             except Exception as exc:
                 print(f"           Warning: tar extraction failed: {exc}")
@@ -523,8 +767,12 @@ def download_ncei_data(results, output_dir, overwrite=False, companion_extension
         # Download companion files (.bot, .idx, etc.)
         if companion_extensions:
             all_paths.extend(
-                _download_companions(url, dest, output_dir, companion_extensions, overwrite)
+                _download_companions(
+                    url, dest, download_dir, companion_extensions, overwrite
+                )
             )
 
-    print(f"Download complete. {len(all_paths)} file(s) ready.")
-    return all_paths
+    print(
+        f"Download complete. {len(all_paths)} file(s) ready in {download_dir}"
+    )
+    return {"downloaded_paths": all_paths, "download_dir": download_dir}
