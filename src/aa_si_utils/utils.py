@@ -453,27 +453,93 @@ def _validate_boolean_mask(mask, mask_name):
         raise TypeError(f"{mask_name} must have boolean dtype")
 
 
+def get_transducer_depth(ds_Sv):
+    """Per-ping transducer depth (m below surface) from a depth-enriched Sv ds.
+
+    Reads the implicit transducer offset baked into ``ds_Sv['depth']`` by
+    ``echopype.consolidate.add_depth``. Because depth = transducer_depth +
+    echo_range * cos(tilt) and echo_range == 0 at ``range_sample=0``, the
+    sample at ``range_sample=0`` equals the transducer depth regardless of
+    which add_depth technique was used (constant offset, platform offsets,
+    beam-angle-derived, etc.).
+
+    Args:
+        ds_Sv (xr.Dataset): Sv dataset that has been passed through
+            ``add_depth`` (must contain a ``depth`` variable).
+
+    Returns:
+        xr.DataArray: Per-ping transducer depth in metres, dim ``ping_time``.
+    """
+    if "depth" not in ds_Sv:
+        raise KeyError("ds_Sv has no 'depth' variable; run add_depth first")
+    td = ds_Sv["depth"].isel(range_sample=0)
+    if "channel" in td.dims:
+        td = td.isel(channel=0, drop=True)
+    return td
+
+
 def detect_seafloor(ds_Sv=None, echodata=None, channel=None, min_valid_depth_m=10.0):
-    """Detect seafloor depth and return a 1-D ``(ping_time,)`` DataArray."""
+    """Detect seafloor depth and return a 1-D ``(ping_time,)`` DataArray.
+
+    The returned line is in metres. Its vertical reference depends on whether
+    ``ds_Sv`` has been passed through ``echopype.consolidate.add_depth``:
+
+    * If ``ds_Sv`` contains a ``depth`` variable, the line is **surface
+      referenced** (metres below surface) so it can be compared directly
+      against ``ds_Sv['depth']`` in :func:`create_seafloor_mask`.
+    * Otherwise the line is **transducer referenced** (metres along the beam
+      from the transducer face), matching ``ds_Sv['echo_range']``.
+    """
     seafloor_depth = _get_detected_seafloor_depth(echodata)
 
     if channel is None:
         _, _, best_seafloor = _find_best_seafloor_detection(
             echodata, ds_Sv, min_valid_depth_m=min_valid_depth_m
         )
-        return best_seafloor.squeeze(drop=True)
+        seafloor_line = best_seafloor.squeeze(drop=True)
+    else:
+        channel_values = seafloor_depth["channel"].values
+        channel_index = _resolve_channel_index(channel, channel_values, ds_Sv=ds_Sv)
+        seafloor_line = seafloor_depth.isel(channel=channel_index).squeeze(drop=True)
 
-    channel_values = seafloor_depth["channel"].values
-    channel_index = _resolve_channel_index(channel, channel_values, ds_Sv=ds_Sv)
-    return seafloor_depth.isel(channel=channel_index).squeeze(drop=True)
+    # Promote to surface-referenced depth when ds_Sv carries a depth variable
+    # (i.e., add_depth was run upstream). Keeps the output consistent with
+    # echopype's detect_seafloor and lets create_seafloor_mask compare
+    # against ds_Sv['depth'] directly.
+    if ds_Sv is not None and "depth" in ds_Sv:
+        seafloor_line = seafloor_line + get_transducer_depth(ds_Sv)
+
+    return seafloor_line
 
 
-def create_seafloor_mask(ds_Sv, seafloor_depth, seafloor_buffer_m=0.0):
-    """Create a boolean mask that keeps samples above the detected seafloor."""
+def create_seafloor_mask(ds_Sv, seafloor_depth, seafloor_buffer_m=0.0, range_var=None):
+    """Create a boolean mask that keeps samples above the detected seafloor.
+
+    The comparison is metres-vs-metres at every ``(channel, ping_time,
+    range_sample)`` cell. Both sides of the comparison must use the same
+    vertical reference. ``range_var`` selects which meter-valued variable on
+    ``ds_Sv`` to compare against:
+
+    * ``"depth"`` (metres below surface) — pair with a surface-referenced
+      ``seafloor_depth`` line.
+    * ``"echo_range"`` (metres along beam from transducer) — pair with a
+      transducer-referenced ``seafloor_depth`` line.
+
+    When ``range_var`` is ``None`` (default), it auto-selects ``"depth"`` if
+    that variable is present on ``ds_Sv`` (i.e., ``add_depth`` was run),
+    otherwise falls back to ``"echo_range"``.
+    """
+    if range_var is None:
+        range_var = "depth" if "depth" in ds_Sv else "echo_range"
+    if range_var not in ds_Sv:
+        raise KeyError(
+            f"range_var '{range_var}' not found in ds_Sv. "
+            "Run add_depth before create_seafloor_mask if using 'depth'."
+        )
     normalized_depth = _normalize_seafloor_depth(seafloor_depth, ds_Sv)
     expanded_depth = normalized_depth.expand_dims(channel=ds_Sv["channel"])
     expanded_depth = expanded_depth.transpose("channel", "ping_time")
-    return (ds_Sv["echo_range"] <= (expanded_depth - seafloor_buffer_m)).astype(bool)
+    return (ds_Sv[range_var] <= (expanded_depth - seafloor_buffer_m)).astype(bool)
 
 
 def create_surface_mask(ds_Sv, surface_depth_m=0.0):
