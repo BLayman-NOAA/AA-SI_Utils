@@ -17,6 +17,24 @@ import pandas as pd
 import xarray as xr
 
 
+def _computed_values(data):
+    """Return NumPy values, explicitly computing lazy xarray/dask inputs."""
+    if hasattr(data, "compute"):
+        data = data.compute()
+    if hasattr(data, "values"):
+        return data.values
+    return np.asarray(data)
+
+
+def _computed_item(data):
+    """Return a Python scalar, explicitly computing lazy xarray/dask inputs."""
+    if hasattr(data, "compute"):
+        data = data.compute()
+    if hasattr(data, "item"):
+        return data.item()
+    return np.asarray(data).item()
+
+
 def get_closest_index_for_depth(sv_data, target_depth):
     """Find the range_sample index closest to a target depth.
     
@@ -37,10 +55,10 @@ def get_closest_index_for_depth(sv_data, target_depth):
     depth_diff = np.abs(echo_range_1d - target_depth)
 
     # Find the index of the minimum difference
-    range_sample_index = depth_diff.argmin().item()
+    range_sample_index = int(np.argmin(_computed_values(depth_diff)))
 
     # Get the actual depth at that index
-    actual_depth = echo_range_1d.isel(range_sample=range_sample_index).item()
+    actual_depth = _computed_item(echo_range_1d.isel(range_sample=range_sample_index))
 
     print(f"Target depth: {target_depth} m")
     print(f"Closest range_sample index: {range_sample_index}")
@@ -83,7 +101,7 @@ def find_data_depth_range(sv_data, ping_min=None, ping_max=None, channel=0):
     has_data_by_range = valid_data.any(dim='ping_time')
     
     # Find first and last range samples with data
-    range_indices_with_data = np.where(has_data_by_range.values)[0]
+    range_indices_with_data = np.where(_computed_values(has_data_by_range))[0]
     
     if len(range_indices_with_data) == 0:
         print("Warning: No valid data found in specified ping range")
@@ -94,8 +112,8 @@ def find_data_depth_range(sv_data, ping_min=None, ping_max=None, channel=0):
     
     # Get the corresponding depths from echo_range
     echo_range_data = sv_data['echo_range'].isel(channel=channel, ping_time=ping_min)
-    min_depth = echo_range_data.isel(range_sample=min_range_idx).item()
-    max_depth = echo_range_data.isel(range_sample=max_range_idx).item()
+    min_depth = _computed_item(echo_range_data.isel(range_sample=min_range_idx))
+    max_depth = _computed_item(echo_range_data.isel(range_sample=max_range_idx))
     
     return min_depth, max_depth
 

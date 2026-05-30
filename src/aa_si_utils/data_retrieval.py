@@ -311,6 +311,22 @@ def _add_spatial_params(params, bbox=None, center_point=None, radius_nm=None):
         print(f"Spatial filter: {radius_nm} nm radius around ({lon}, {lat})")
 
 
+def _geometry_has_vertex_in_bbox(geometry, bbox):
+    """Return True when any ArcGIS polyline vertex falls within *bbox*."""
+    if not geometry or "paths" not in geometry:
+        return False
+
+    west, south, east, north = bbox
+    for path in geometry.get("paths", []):
+        for point in path:
+            if len(point) < 2:
+                continue
+            lon, lat = point[0], point[1]
+            if west <= lon <= east and south <= lat <= north:
+                return True
+    return False
+
+
 def _fetch_all_pages(params):
     """Paginate through the ArcGIS MapServer and return all attribute dicts."""
     all_items = []
@@ -329,7 +345,11 @@ def _fetch_all_pages(params):
             return []
 
         features = data.get("features", [])
-        all_items.extend(f["attributes"] for f in features)
+        for feature in features:
+            item = dict(feature["attributes"])
+            if "geometry" in feature:
+                item["_WCSD_GEOMETRY"] = feature["geometry"]
+            all_items.append(item)
 
         if not data.get("exceededTransferLimit"):
             break
@@ -479,7 +499,10 @@ def query_ncei_data(
             after all other filters; results are sorted chronologically by
             filename timestamp.
         bbox (tuple | None): Bounding box ``(west, south, east, north)`` in
-            WGS 84 decimal degrees.
+            WGS 84 decimal degrees. Server-side filtering first uses ArcGIS
+            polyline/envelope intersection, then client-side filtering keeps
+            only files with at least one returned geometry vertex inside the
+            bbox.
         center_point (tuple | None): ``(longitude, latitude)`` for a
             radius-based spatial query.
         radius_nm (float | None): Search radius in nautical miles (requires
@@ -560,7 +583,7 @@ def query_ncei_data(
         "f": "json",
         "where": where_clause,
         "outFields": "*",
-        "returnGeometry": "false",
+        "returnGeometry": "true" if bbox is not None else "false",
         "orderByFields": "FILE_NAME",
     }
 
@@ -574,6 +597,18 @@ def query_ncei_data(
     except requests.exceptions.RequestException as exc:
         print(f"Network error: {exc}")
         return {"records": [], "query_label": query_label}
+
+    if bbox is not None:
+        before = len(items)
+        items = [
+            item
+            for item in items
+            if _geometry_has_vertex_in_bbox(item.get("_WCSD_GEOMETRY"), bbox)
+        ]
+        print(
+            f"  Geometry bbox filter: {before} -> {len(items)} results "
+            f"with at least one vertex inside bbox"
+        )
 
     # Enrich with FILE_DATETIME
     for item in items:
@@ -613,6 +648,12 @@ def query_ncei_data(
 
     if max_files is not None:
         items = items[:max_files]
+
+    for item in items:
+        item.pop("_WCSD_GEOMETRY", None)
+        file_datetime = item.get("FILE_DATETIME")
+        if isinstance(file_datetime, datetime):
+            item["FILE_DATETIME"] = file_datetime.isoformat()
 
     print(f"Query returned {len(items)} result(s). Label: {query_label}")
     return {"records": items, "query_label": query_label}
@@ -656,8 +697,10 @@ def download_ncei_data(
             is a dict (its embedded ``query_label`` is used).
 
     Returns:
-        dict: ``{"downloaded_paths": list[Path], "download_dir": Path}`` where
-        ``download_dir`` is the resolved per-query subfolder.
+        dict: ``{"downloaded_paths": list[str], "download_dir": str}`` where
+        ``download_dir`` is the per-query subfolder. Paths are returned as
+        forward-slash strings so recipe checkpoints remain JSON-serializable
+        and portable across operating systems.
 
     Example::
 
@@ -775,4 +818,7 @@ def download_ncei_data(
     print(
         f"Download complete. {len(all_paths)} file(s) ready in {download_dir}"
     )
-    return {"downloaded_paths": all_paths, "download_dir": download_dir}
+    return {
+        "downloaded_paths": [path.as_posix() for path in all_paths],
+        "download_dir": download_dir.as_posix(),
+    }

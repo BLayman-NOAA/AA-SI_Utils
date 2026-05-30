@@ -3,6 +3,7 @@
 """Unit tests for the pure mask-building helpers."""
 
 import numpy as np
+import pytest
 import xarray as xr
 
 from aa_si_utils import utils
@@ -65,6 +66,29 @@ def test_detect_seafloor_returns_best_channel_depth():
 
     assert seafloor_depth.dims == ("ping_time",)
     np.testing.assert_allclose(seafloor_depth.values, np.array([30.0, 31.0, 29.0]))
+
+
+def test_get_closest_index_for_depth_supports_chunked_data():
+    pytest.importorskip("dask.array")
+    ds_Sv = _make_ds_sv().chunk({"ping_time": 1, "range_sample": 2})
+
+    range_sample_index = utils.get_closest_index_for_depth(ds_Sv, 24.0)
+
+    assert range_sample_index == 2
+
+
+def test_find_data_depth_range_supports_chunked_data():
+    pytest.importorskip("dask.array")
+    ds_Sv = _make_ds_sv()
+    sv = ds_Sv["Sv"].copy()
+    sv.loc[dict(range_sample=[0, 3])] = np.nan
+    ds_Sv["Sv"] = sv
+    ds_Sv = ds_Sv.chunk({"ping_time": 1, "range_sample": 2})
+
+    min_depth, max_depth = utils.find_data_depth_range(ds_Sv, ping_min=0, ping_max=2)
+
+    assert min_depth == 15.0
+    assert max_depth == 25.0
 
 
 def test_detect_seafloor_supports_explicit_channel_selection():

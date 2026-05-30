@@ -10,7 +10,9 @@ is covered here; the live ArcGIS / S3 paths are intentionally not tested.
 from __future__ import annotations
 
 import io
+import json
 import tarfile
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -157,6 +159,20 @@ def _make_record(filename: str) -> dict:
     }
 
 
+def test_query_returns_json_safe_file_datetime(monkeypatch):
+    monkeypatch.setattr(
+        dr,
+        "_fetch_all_pages",
+        lambda params: [_make_record("D20160725-T210000.raw")],
+    )
+
+    result = dr.query_ncei_data(file_time_start="2016-07-25T20:00")
+
+    file_datetime = result["records"][0]["FILE_DATETIME"]
+    assert file_datetime == "2016-07-25T21:00:00"
+    json.dumps(result)
+
+
 def test_download_creates_per_query_subfolder(monkeypatch, tmp_path):
     _install_fake_network(monkeypatch, body=b"fake raw bytes")
 
@@ -169,10 +185,13 @@ def test_download_creates_per_query_subfolder(monkeypatch, tmp_path):
     )
 
     expected_dir = tmp_path / "HB1603_2016-07-25_2100-2200"
-    assert result["download_dir"] == expected_dir
+    assert result["download_dir"] == expected_dir.as_posix()
     assert expected_dir.is_dir()
     assert (expected_dir / "D20160725-T210000.raw").is_file()
-    assert result["downloaded_paths"] == [expected_dir / "D20160725-T210000.raw"]
+    assert result["downloaded_paths"] == [
+        (expected_dir / "D20160725-T210000.raw").as_posix()
+    ]
+    json.dumps(result)
 
 
 def test_download_query_id_overrides_label(monkeypatch, tmp_path):
@@ -186,7 +205,7 @@ def test_download_query_id_overrides_label(monkeypatch, tmp_path):
 
     assert (tmp_path / "my_chosen_name").is_dir()
     assert not (tmp_path / "auto").exists()
-    assert result["download_dir"] == tmp_path / "my_chosen_name"
+    assert result["download_dir"] == (tmp_path / "my_chosen_name").as_posix()
 
 
 def test_download_query_id_dotdot_cannot_escape_output_dir(monkeypatch, tmp_path):
@@ -198,7 +217,7 @@ def test_download_query_id_dotdot_cannot_escape_output_dir(monkeypatch, tmp_path
         query_id="..",
     )
 
-    assert result["download_dir"] == tmp_path / "downloads"
+    assert result["download_dir"] == (tmp_path / "downloads").as_posix()
     assert (tmp_path / "downloads" / "D20160725-T210000.raw").is_file()
     assert not (tmp_path.parent / "D20160725-T210000.raw").exists()
 
@@ -236,7 +255,7 @@ def test_download_accepts_bare_list_with_query_label_kwarg(monkeypatch, tmp_path
         output_dir=tmp_path,
         query_label="from_kwarg",
     )
-    assert result["download_dir"] == tmp_path / "from_kwarg"
+    assert result["download_dir"] == (tmp_path / "from_kwarg").as_posix()
 
 
 def test_download_skips_existing_tar_extraction(monkeypatch, tmp_path):
@@ -272,5 +291,5 @@ def test_download_skips_existing_tar_extraction(monkeypatch, tmp_path):
     monkeypatch.setattr(dr.requests, "get", counting_get)
     out2 = dr.download_ncei_data(payload, output_dir=tmp_path)
     assert call_count["n"] == 0
-    assert out2["download_dir"] == tmp_path / "tarq"
-    assert any(p.name == "inner.raw" for p in out2["downloaded_paths"])
+    assert out2["download_dir"] == (tmp_path / "tarq").as_posix()
+    assert any(Path(p).name == "inner.raw" for p in out2["downloaded_paths"])
