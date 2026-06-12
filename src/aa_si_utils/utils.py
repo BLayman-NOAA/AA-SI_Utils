@@ -9,6 +9,7 @@ using the echopype library.
 
 import colorsys
 import math
+import shutil
 from pathlib import Path
 
 import echopype as ep
@@ -930,26 +931,44 @@ def log_mask_stats(mask):
     print(f"  - Points masked: {masked_points} ({100*(masked_points/total_points):.1f}%)")
 
 
-def initial_setup_and_validation(raw_input_folder, netcdf_output_folder_string, sv_output_folder_string,
-                                  output_logs_folder_string, raw_file_names=None, clear_previous_json_logs=True):
+def initial_setup_and_validation(raw_input_folder, calibration_outputs_string="calibration",
+                                  raw_file_names=None, clear_previous_json_logs=True):
     """Set up output folders, resolve raw file paths, and optionally clear previous logs.
 
     Args:
         raw_input_folder: Path to the folder containing raw input files.
-        netcdf_output_folder_string: String path for netCDF output folder.
-        sv_output_folder_string: String path for Sv output folder.
-        output_logs_folder_string: String path for output logs folder.
+        calibration_outputs_string: Subdirectory name for calibration artifacts. When
+            running inside the recipe executor this is resolved relative to the pipeline's
+            user-facing outputs directory (``artifacts_dir`` from the execution context)
+            so calibration files land alongside images and logs under ``outputs/``.
+            Falls back to a CWD-relative path when called standalone (e.g. in a notebook).
+            Calibration JSON logs are written to a ``logs/`` subdirectory within this
+            folder (i.e. ``<calibration_outputs>/logs/``).
         raw_file_names: Optional list of specific raw file name strings to process.
             If empty or None, all .raw files in raw_input_folder are used.
         clear_previous_json_logs: If True, delete existing calibration_flags.json (default: True).
 
     Returns:
-        list[str]: List of string paths to raw files found in raw_input_folder.
+        dict with keys:
+            raw_file_paths: list[str] of absolute paths to raw acoustic files.
+            calibration_output_dir: str resolved full path to the calibration outputs folder.
     """
     raw_input_folder = Path(raw_input_folder)
-    netcdf_output_folder = Path(netcdf_output_folder_string)
-    sv_output_folder = Path(sv_output_folder_string)
-    output_logs_folder = Path(output_logs_folder_string)
+
+    # Resolve the calibration output directory relative to the pipeline outputs dir
+    # when running inside the executor; fall back to CWD-relative when standalone.
+    try:
+        from aa_recipe_manager.executor.runtime_context import get_execution_context  # noqa: PLC0415
+        ctx = get_execution_context()
+        if ctx.artifacts_dir is not None:
+            calibration_output_dir = Path(ctx.artifacts_dir) / calibration_outputs_string
+        else:
+            calibration_output_dir = Path(calibration_outputs_string)
+    except ImportError:
+        calibration_output_dir = Path(calibration_outputs_string)
+
+    # Logs always live at <calibration_outputs>/logs — not user-configurable.
+    calibration_logs_dir = calibration_output_dir / "logs"
 
     # Get list of raw files to process
     if raw_file_names is not None and len(raw_file_names) > 0:
@@ -964,23 +983,158 @@ def initial_setup_and_validation(raw_input_folder, netcdf_output_folder_string, 
     for path in raw_file_paths:
         print(f"  - {path.name}")
 
-    # Ensure output folders exist
-    output_folders = [
-        netcdf_output_folder,
-        sv_output_folder,
-        output_logs_folder,
-    ]
-    for folder in output_folders:
-        if not folder.exists():
-            folder.mkdir(parents=True, exist_ok=True)
-            print(f"Created missing output folder: {folder}")
+    # Ensure calibration log folder exists (parents=True also creates calibration_output_dir)
+    if not calibration_logs_dir.exists():
+        calibration_logs_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Created missing output folder: {calibration_logs_dir}")
 
     if clear_previous_json_logs:
-        flags_file = Path(output_logs_folder) / "calibration_flags.json"
+        flags_file = calibration_logs_dir / "calibration_flags.json"
         if flags_file.exists():
             flags_file.unlink()
 
-    return [str(p) for p in raw_file_paths]
+    return {
+        "raw_file_paths": [str(p) for p in raw_file_paths],
+        "calibration_output_dir": str(calibration_output_dir),
+    }
+
+
+def _resolve_intermediate_dir() -> Path:
+    """Resolve the directory for per-file intermediate stores.
+
+    When running inside the recipe executor the directory is read from
+    ``ExecutionContext.temp_dir`` (set to ``exe_temp/``) and the stores are
+    written under ``<temp_dir>/data/``.  Falls back to a sub-directory of the
+    OS temp folder when called standalone (e.g. in a plain script or notebook).
+    """
+    import tempfile
+    try:
+        from aa_recipe_manager.executor.runtime_context import get_execution_context  # noqa: PLC0415
+        ctx = get_execution_context()
+        if ctx.temp_dir is not None:
+            return Path(ctx.temp_dir) / "data"
+    except ImportError:
+        pass
+    return Path(tempfile.gettempdir()) / "aa_si_utils_temp" / "data"
+
+
+def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=True,
+                              intermediate_format="netcdf", use_swap="auto"):
+    """Open raw sonar files and write each as an intermediate store.
+
+    Args:
+        raw_file_paths: List of string paths or Path objects pointing to raw files.
+        sonar_model: Sonar model string for echopype (default: "EK60").
+        include_bot: Whether to include .bot files (default: True).
+        intermediate_format: ``"netcdf"`` (default), ``"zarr"``, or ``"none"``.
+            ``"none"`` returns in-memory EchoData objects without writing any
+            files.
+
+            **Recommended options are ``"netcdf"`` and ``"none"``.**
+
+            ``"netcdf"`` is the default and the most reliable choice: each raw
+            file is written to a temporary ``.nc`` file, then reopened and
+            combined by ``combine_raw_stores``.  After combining, all groups
+            are rechunked to a single uniform chunk so the downstream zarr v2
+            checkpoint write (``combine_raw`` step with ``checkpoint: always``)
+            always succeeds.
+
+            ``"none"`` keeps every ``EchoData`` object in memory without
+            touching disk.  Suitable when the full dataset fits comfortably in
+            RAM.
+
+            ``"zarr"`` is available for experimentation but is **not
+            recommended** in the current workflow.  The zarr v3 intermediate
+            stores use serializer-backed dtypes that are incompatible with the
+            zarr v2 checkpoint writer used for ``EchoData`` checkpoints.  Using
+            ``"zarr"`` will reproduce the error::
+
+                Zarr format 2 arrays do not support `serializer`.
+
+            Use ``"netcdf"`` or ``"none"`` instead.
+        use_swap: Passed to ``ep.open_raw`` as ``use_swap`` (default: ``"auto"``).
+
+    Returns:
+        list: Store path strings (zarr/netcdf) for file-backed formats, or a
+        list of in-memory EchoData objects for ``intermediate_format="none"``.
+    """
+    if not raw_file_paths:
+        raise ValueError("No raw files provided")
+
+    store_dir = None
+    if intermediate_format != "none":
+        store_dir = _resolve_intermediate_dir()
+        store_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for raw_path in raw_file_paths:
+        raw_path = Path(raw_path)
+        ed = ep.open_raw(raw_path, sonar_model=sonar_model, include_bot=include_bot,
+                         use_swap=use_swap)
+
+        if intermediate_format == "none":
+            results.append(ed)
+        elif intermediate_format == "netcdf":
+            store_path = store_dir / f"{raw_path.stem}.nc"
+            ed.to_netcdf(save_path=store_path)
+            results.append(str(store_path))
+        else:  # zarr (default)
+            store_path = store_dir / f"{raw_path.stem}.zarr"
+            if store_path.exists():
+                shutil.rmtree(store_path)
+            ed.to_zarr(save_path=store_path, zarr_format=3)
+            results.append(str(store_path))
+
+    print(f"Read {len(raw_file_paths)} raw file(s) to '{intermediate_format}' format")
+    return results
+
+
+def combine_raw_stores(raw_stores):
+    """Combine per-file stores or in-memory EchoData objects into a single EchoData.
+
+    Args:
+        raw_stores: List of store path strings (zarr/netcdf) produced by
+            ``read_raw_files_to_stores``, or a list of in-memory EchoData
+            objects (for ``intermediate_format="none"`` mode).
+
+    Returns:
+        EchoData: Combined EchoData object (lazily backed for file-based inputs).
+    """
+    if not raw_stores:
+        raise ValueError("No raw stores provided")
+
+    echodata_list = []
+    for item in raw_stores:
+        if isinstance(item, (str, Path)):
+            echodata_list.append(ep.open_converted(str(item), chunks={}))
+        else:
+            # Already an in-memory EchoData object (none mode)
+            echodata_list.append(item)
+
+    if len(echodata_list) == 1:
+        echodata = echodata_list[0]
+    else:
+        echodata = ep.combine_echodata(echodata_list)
+        print(f"Combined {len(echodata_list)} stores into one EchoData object")
+
+    # After combine_echodata the per-file dask chunks are simply concatenated,
+    # which produces uneven final chunks whenever the files have different ping
+    # counts (e.g. (3896, 3921)).  Zarr v2 requires the final chunk to be <=
+    # the first, so checkpoint writes fail.  Rechunking to a single chunk per
+    # dimension restores the behaviour of the original in-memory combine path.
+    for group_path in echodata.group_paths:
+        ds = echodata[group_path]
+        if ds is None:
+            continue
+        ds = ds.chunk(-1)
+        for v in ds.variables:
+            ds[v].encoding.pop("chunks", None)
+            ds[v].encoding.pop("preferred_chunks", None)
+        echodata[group_path] = ds
+
+    check_for_seafloor_depth_data(echodata)
+    print("EchoData ready for processing")
+    return echodata
 
 
 def open_and_combine_raw_files(raw_file_paths, netcdf_output_folder, sonar_model="EK60", include_bot=True):
@@ -1044,12 +1198,13 @@ def check_for_seafloor_depth_data(ed):
     """
     if 'detected_seafloor_depth' in ed['Vendor_specific']:
         seafloor_depth = ed['Vendor_specific']['detected_seafloor_depth']
+        seafloor_depth_values = _computed_values(seafloor_depth)
         print("Bottom detection data available!")
-        print(f"Min depth: {seafloor_depth.min().values:.1f} m")
-        print(f"Max depth: {seafloor_depth.max().values:.1f} m")
-        print(f"Mean depth: {seafloor_depth.mean().values:.1f} m")
-        print(f"Median depth: {seafloor_depth.median().values:.1f} m")
-        print(f"Std deviation: {seafloor_depth.std().values:.1f} m")
+        print(f"Min depth: {np.nanmin(seafloor_depth_values):.1f} m")
+        print(f"Max depth: {np.nanmax(seafloor_depth_values):.1f} m")
+        print(f"Mean depth: {np.nanmean(seafloor_depth_values):.1f} m")
+        print(f"Median depth: {np.nanmedian(seafloor_depth_values):.1f} m")
+        print(f"Std deviation: {np.nanstd(seafloor_depth_values):.1f} m")
     else:
         print("Error: No bottom detection data found in the raw file. Sv effects not valid!")
         raise ValueError("Error: No seafloor depth data found in the raw file. Sv effects not valid!")

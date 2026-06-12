@@ -656,6 +656,8 @@ def query_ncei_data(
             item["FILE_DATETIME"] = file_datetime.isoformat()
 
     print(f"Query returned {len(items)} result(s). Label: {query_label}")
+    for item in items:
+        print(f"  {item.get('FILE_NAME', '<unknown>')}")
     return {"records": items, "query_label": query_label}
 
 
