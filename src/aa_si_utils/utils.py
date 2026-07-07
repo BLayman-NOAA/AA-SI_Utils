@@ -9,13 +9,27 @@ using the echopype library.
 
 import colorsys
 import math
+import os
 import shutil
+import stat
+import time
 from pathlib import Path
 
 import echopype as ep
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+from aa_si_utils import _storage
+
+
+# Target number of pings per chunk along ``ping_time`` when writing the combined
+# EchoData checkpoint.  Uniform chunks (equal size with a smaller remainder last)
+# satisfy the zarr v2 rule that every chunk but the last be uniform and the last
+# be <= the others, while keeping multiple chunks along time so bucket-backed
+# (remote) reads stay lazy instead of pulling whole variables at once.  Tune down
+# for smaller per-chunk transfers, up for fewer/larger reads.
+DEFAULT_PING_TIME_CHUNK = 1000
 
 
 def _computed_values(data):
@@ -839,6 +853,24 @@ def apply_mask_to_sv(ds_Sv, mask, fill_value=np.nan):
     Returns:
         xr.Dataset: Masked copy of *ds_Sv*.
     """
+        # Eagerly load coordinate variables that masks depend on
+    coords_to_load = ['echo_range', 'depth']
+    for coord in coords_to_load:
+        if coord in ds_Sv and hasattr(ds_Sv[coord], 'chunks') and ds_Sv[coord].chunks is not None:
+            print(f"Loading {coord} coordinate...", flush=True)
+            ds_Sv[coord] = ds_Sv[coord].compute()
+            
+        # Force computation of the Sv variable specifically (not just the dataset)
+    if hasattr(mask, 'compute'):
+        print("Computing mask...", flush=True)
+        mask = mask.compute()
+    
+    if 'Sv' in ds_Sv and hasattr(ds_Sv['Sv'], 'chunks') and ds_Sv['Sv'].chunks is not None:
+        print(f"Sv is lazy (shape: {ds_Sv['Sv'].shape}, chunks: {ds_Sv['Sv'].chunks})", flush=True)
+        print("Computing Sv variable...", flush=True)
+        ds_Sv['Sv'] = ds_Sv['Sv'].compute()
+        print("Sv computed.", flush=True)
+
     ed_masked = ep.mask.apply_mask(
         source_ds=ds_Sv,
         mask=mask,
@@ -999,23 +1031,69 @@ def initial_setup_and_validation(raw_input_folder, calibration_outputs_string="c
     }
 
 
-def _resolve_intermediate_dir() -> Path:
-    """Resolve the directory for per-file intermediate stores.
+def _execution_temp_dir():
+    """Return ``ExecutionContext.temp_dir`` (Path/StorageLocation) or None."""
+    try:
+        from aa_recipe_manager.executor.runtime_context import get_execution_context  # noqa: PLC0415
+        return get_execution_context().temp_dir
+    except ImportError:
+        return None
+
+
+def _resolve_intermediate_dir() -> tuple[Path | str, dict | None]:
+    """Resolve the per-file intermediate store directory and its storage options.
 
     When running inside the recipe executor the directory is read from
     ``ExecutionContext.temp_dir`` (set to ``exe_temp/``) and the stores are
     written under ``<temp_dir>/data/``.  Falls back to a sub-directory of the
     OS temp folder when called standalone (e.g. in a plain script or notebook).
+
+    Returns a ``(data_dir, storage_options)`` pair where ``data_dir`` is a
+    local ``Path`` or, for a ``gs://`` scratch dir, a URL string.
     """
     import tempfile
-    try:
-        from aa_recipe_manager.executor.runtime_context import get_execution_context  # noqa: PLC0415
-        ctx = get_execution_context()
-        if ctx.temp_dir is not None:
-            return Path(ctx.temp_dir) / "data"
-    except ImportError:
-        pass
-    return Path(tempfile.gettempdir()) / "aa_si_utils_temp" / "data"
+    temp_dir = _execution_temp_dir()
+    if temp_dir is not None:
+        return _storage.join(temp_dir, "data"), _storage.storage_options_of(temp_dir)
+    return Path(tempfile.gettempdir()) / "aa_si_utils_temp" / "data", None
+
+
+def _remove_existing_store(path):
+    """Remove a store dir/file, clearing the Windows read-only bit if needed."""
+    path = Path(path)
+    if not path.exists():
+        return
+    if path.is_dir():
+        def _on_error(func, fpath, _exc_info):
+            os.chmod(fpath, stat.S_IWRITE)
+            func(fpath)
+        shutil.rmtree(path, onerror=_on_error)
+    else:
+        path.unlink()
+
+
+def _write_store_with_retry(write_fn, store_path, max_retries=3, base_delay=1.0):
+    """Retry a zarr store write on transient Windows PermissionError.
+
+    zarr-python v3 writes each metadata file atomically: bytes go to a
+    ``.partial`` temp file which is then renamed into place.  On Windows,
+    antivirus or the file-indexing service can hold an exclusive lock on the
+    temp file between the write and rename steps, failing the rename with
+    PermissionError [WinError 5].  Mirrors the recipe manager's checkpoint
+    writer mitigation: clean up any partially-written store and retry after
+    an increasing delay (1 s, 2 s).
+    """
+    last_exc = None
+    for attempt in range(max_retries):
+        _remove_existing_store(store_path)
+        try:
+            write_fn()
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_exc
 
 
 def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=True,
@@ -1062,9 +1140,19 @@ def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=Tru
         raise ValueError("No raw files provided")
 
     store_dir = None
+    store_options = None
+    remote = False
     if intermediate_format != "none":
-        store_dir = _resolve_intermediate_dir()
-        store_dir.mkdir(parents=True, exist_ok=True)
+        store_dir, store_options = _resolve_intermediate_dir()
+        remote = _storage.is_remote(store_dir)
+        if remote and intermediate_format == "netcdf":
+            raise ValueError(
+                "netcdf intermediates require a local temp dir (HDF5 needs "
+                "seekable writes and cannot be written to object storage). "
+                "Use intermediate_format='zarr' or point --temp-dir at a local "
+                f"directory instead of {store_dir!r}."
+            )
+        _storage.makedirs(store_dir, store_options)
 
     results = []
     for raw_path in raw_file_paths:
@@ -1078,24 +1166,44 @@ def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=Tru
             store_path = store_dir / f"{raw_path.stem}.nc"
             ed.to_netcdf(save_path=store_path)
             results.append(str(store_path))
-        else:  # zarr (default)
-            store_path = store_dir / f"{raw_path.stem}.zarr"
-            if store_path.exists():
-                shutil.rmtree(store_path)
-            ed.to_zarr(save_path=store_path, zarr_format=3)
+        else:
+            store_path = _storage.join(store_dir, f"{raw_path.stem}.zarr")
+            # Match the checkpoint writer exactly: zarr_format=2 and compress=False.
+            # Writing v3 encodes echopype's fixed-length UTF-32 string metadata
+            # with a v3 serializer the v2 checkpoint write cannot express
+            # ("Zarr format 2 arrays do not support serializer").  Leaving
+            # compression on makes echopype attach a zarr-v3 BloscCodec that a
+            # v2 write also rejects ("Invalid compressor ... Got BloscCodec");
+            # compress=False sidesteps it, consistent with the checkpoint store.
+            if remote:
+                # Object storage: no Windows rename-lock, so no retry wrapper;
+                # thread storage options so echopype writes to the bucket.
+                _storage.remove_store(store_path, store_options)
+                ed.to_zarr(save_path=str(store_path), zarr_format=2,
+                           compress=False,
+                           output_storage_options=store_options or {})
+            else:
+                _write_store_with_retry(
+                    lambda: ed.to_zarr(save_path=store_path, zarr_format=2,
+                                       compress=False),
+                    store_path,
+                )
             results.append(str(store_path))
 
     print(f"Read {len(raw_file_paths)} raw file(s) to '{intermediate_format}' format")
     return results
 
 
-def combine_raw_stores(raw_stores):
+def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
     """Combine per-file stores or in-memory EchoData objects into a single EchoData.
 
     Args:
         raw_stores: List of store path strings (zarr/netcdf) produced by
             ``read_raw_files_to_stores``, or a list of in-memory EchoData
             objects (for ``intermediate_format="none"`` mode).
+        ping_time_chunk: Target chunk length along ``ping_time`` for the combined
+            object (default: ``DEFAULT_PING_TIME_CHUNK``).  Controls the chunking
+            of the downstream zarr checkpoint.
 
     Returns:
         EchoData: Combined EchoData object (lazily backed for file-based inputs).
@@ -1103,10 +1211,27 @@ def combine_raw_stores(raw_stores):
     if not raw_stores:
         raise ValueError("No raw stores provided")
 
+    # Remote (bucket-backed) stores need storage options to open. The store
+    # strings are opaque, so recover the options from the same exe_temp scratch
+    # location the read step used (usually empty for gs:// under ADC / memory://).
+    remote_options = None
+    if any(
+        isinstance(item, (str, Path)) and _storage.is_remote(item)
+        for item in raw_stores
+    ):
+        remote_options = _storage.storage_options_of(_execution_temp_dir())
+
     echodata_list = []
     for item in raw_stores:
         if isinstance(item, (str, Path)):
-            echodata_list.append(ep.open_converted(str(item), chunks={}))
+            if _storage.is_remote(item):
+                echodata_list.append(
+                    ep.open_converted(
+                        str(item), chunks={}, storage_options=remote_options
+                    )
+                )
+            else:
+                echodata_list.append(ep.open_converted(str(item), chunks={}))
         else:
             # Already an in-memory EchoData object (none mode)
             echodata_list.append(item)
@@ -1118,18 +1243,39 @@ def combine_raw_stores(raw_stores):
         print(f"Combined {len(echodata_list)} stores into one EchoData object")
 
     # After combine_echodata the per-file dask chunks are simply concatenated,
-    # which produces uneven final chunks whenever the files have different ping
-    # counts (e.g. (3896, 3921)).  Zarr v2 requires the final chunk to be <=
-    # the first, so checkpoint writes fail.  Rechunking to a single chunk per
-    # dimension restores the behaviour of the original in-memory combine path.
+    # producing uneven chunks along ``ping_time`` whenever files have different
+    # ping counts (e.g. (3896, 3921)).  Zarr v2 requires every chunk but the last
+    # to be uniform and the last to be <= the others, so the naive concatenated
+    # chunking fails to write.  Rechunk the concatenation dimension to a uniform
+    # target size: this satisfies the v2 constraint while keeping multiple chunks
+    # along time so remote (bucket-backed) reads stay lazy instead of pulling
+    # whole variables at once.  Groups without a ``ping_time`` dimension are small
+    # metadata tables and stay single-chunk.
     for group_path in echodata.group_paths:
         ds = echodata[group_path]
         if ds is None:
             continue
-        ds = ds.chunk(-1)
+        if "ping_time" in ds.dims:
+            target = min(ping_time_chunk, ds.sizes["ping_time"])
+            ds = ds.chunk({"ping_time": target})
+        else:
+            ds = ds.chunk(-1)
         for v in ds.variables:
-            ds[v].encoding.pop("chunks", None)
-            ds[v].encoding.pop("preferred_chunks", None)
+            # Clear stale chunk *and* codec encoding carried over from the source
+            # stores.  For zarr intermediates, open_converted records the store's
+            # compressor/filters as zarr-v3 codec objects (e.g. BloscCodec); left
+            # in place they crash the zarr-v2 checkpoint write ("Invalid
+            # compressor ... Got BloscCodec").  Dropping them lets the checkpoint
+            # writer re-derive v2-compatible encoding from its own compress flag.
+            for key in (
+                "chunks",
+                "preferred_chunks",
+                "compressor",
+                "filters",
+                "codecs",
+                "serializer",
+            ):
+                ds[v].encoding.pop(key, None)
         echodata[group_path] = ds
 
     check_for_seafloor_depth_data(echodata)
@@ -1206,6 +1352,6 @@ def check_for_seafloor_depth_data(ed):
         print(f"Median depth: {np.nanmedian(seafloor_depth_values):.1f} m")
         print(f"Std deviation: {np.nanstd(seafloor_depth_values):.1f} m")
     else:
-        print("Error: No bottom detection data found in the raw file. Sv effects not valid!")
-        raise ValueError("Error: No seafloor depth data found in the raw file. Sv effects not valid!")
+        print("Warning: No bottom detection data found in the raw file. Sv effects not valid!")
+        # raise ValueError("Error: No seafloor depth data found in the raw file. Sv effects not valid!")
     
