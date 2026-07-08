@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NetCDF intermediates now raise a clear error when the scratch dir is remote
   (HDF5 needs seekable writes and cannot be written to object storage — use
   `intermediate_format="zarr"` or a local `--temp-dir`).
+- Remote (`gs://`) raw-file **inputs**: `initial_setup_and_validation` lists a
+  remote `raw_input_folder` without downloading, and `read_raw_files_to_stores`
+  downloads each remote `.raw` (plus its `.bot` companion) to a private local
+  scratch dir, converts it, and deletes the local copy before the next file —
+  local disk holds ~1 raw file at a time. `add_dive_profile_to_dataset` reads a
+  `gs://` line CSV in place via pandas. New `_storage` helpers `basename`,
+  `glob_url`, and the `localized_file` context manager; input storage options
+  come from the execution context (`_execution_storage_options`).
+- Optional filename-datetime filtering: `initial_setup_and_validation` gained
+  `file_time_start` / `file_time_end` (inclusive ISO/`datetime` bounds matched
+  against the `D{YYYYMMDD}-T{HHMMSS}` file-name stamp). The NCEI filter logic is
+  now the shared, public `data_retrieval.filter_paths_by_file_time` /
+  `parse_datetime_from_filename` (works on local paths and `gs://` URLs).
 - Initial project structure from NOAA Fisheries AA-SI Python template
 - Utility functions for depth analysis, masking, distance calculations
 - Dive profile integration with MVBS datasets

@@ -26,9 +26,9 @@ _HTTPS_BUCKET_PREFIX = "https://noaa-wcsd-pds.s3.amazonaws.com/"
 _PAGE_SIZE = 1000
 
 
-# Private helpers
+# Filename-time helpers (public: reused for filtering user-supplied folders)
 
-def _parse_datetime_from_filename(filename):
+def parse_datetime_from_filename(filename):
     """Extract a datetime from a WCSD filename.
 
     Matches the ``D{YYYYMMDD}-T{HHMMSS}`` pattern anywhere in the filename,
@@ -41,6 +41,71 @@ def _parse_datetime_from_filename(filename):
         return None
     date_part, time_part = match.groups()
     return datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S")
+
+
+# Back-compat alias for internal call sites predating the public promotion.
+_parse_datetime_from_filename = parse_datetime_from_filename
+
+
+def _coerce_datetime(value):
+    """Accept an ISO string or a datetime; return a datetime (or None)."""
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    return value
+
+
+def _path_basename(path):
+    """Final segment of a local path or URL (handles ``/`` and Windows ``\\``).
+
+    Only the basename is matched against the datetime pattern, so a parent
+    directory that happens to contain a ``D{8}-T{6}`` stamp cannot influence a
+    file's parsed time.
+    """
+    text = str(path).rstrip("/\\")
+    return text.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
+def _in_time_window(file_datetime, file_time_start, file_time_end):
+    """Inclusive window test. Unparseable names (``None``) are excluded."""
+    if file_datetime is None:
+        return False
+    if file_time_start and file_datetime < file_time_start:
+        return False
+    if file_time_end and file_datetime > file_time_end:
+        return False
+    return True
+
+
+def filter_paths_by_file_time(paths, file_time_start=None, file_time_end=None):
+    """Filter raw-file paths by the datetime encoded in their file names.
+
+    Works on local paths and remote URLs (``gs://...``) alike: only the final
+    path segment is inspected, so no file is opened or downloaded. Bounds are
+    inclusive and may be ISO strings or ``datetime`` objects. Names without a
+    parseable ``D{YYYYMMDD}-T{HHMMSS}`` stamp are excluded whenever a bound is
+    given, matching :func:`query_ncei_data`'s filtering semantics.
+
+    Passing no bounds returns the paths unchanged.
+
+    Args:
+        paths: Iterable of path-like values or URL strings.
+        file_time_start: Optional inclusive lower bound.
+        file_time_end: Optional inclusive upper bound.
+
+    Returns:
+        list: The subset of *paths* inside the window, order preserved.
+    """
+    if file_time_start is None and file_time_end is None:
+        return list(paths)
+
+    start = _coerce_datetime(file_time_start)
+    end = _coerce_datetime(file_time_end)
+
+    return [
+        path
+        for path in paths
+        if _in_time_window(parse_datetime_from_filename(_path_basename(path)), start, end)
+    ]
 
 
 def _validate_string_value(value, param_name):
@@ -618,23 +683,17 @@ def query_ncei_data(
 
     # Fine-grained filename-time filtering
     if file_time_start is not None or file_time_end is not None:
-        if isinstance(file_time_start, str):
-            file_time_start = datetime.fromisoformat(file_time_start)
-        if isinstance(file_time_end, str):
-            file_time_end = datetime.fromisoformat(file_time_end)
-
-        def _in_window(item):
-            dt = item.get("FILE_DATETIME")
-            if dt is None:
-                return False
-            if file_time_start and dt < file_time_start:
-                return False
-            if file_time_end and dt > file_time_end:
-                return False
-            return True
+        file_time_start = _coerce_datetime(file_time_start)
+        file_time_end = _coerce_datetime(file_time_end)
 
         before = len(items)
-        items = [i for i in items if _in_window(i)]
+        items = [
+            i
+            for i in items
+            if _in_time_window(
+                i.get("FILE_DATETIME"), file_time_start, file_time_end
+            )
+        ]
         print(
             f"  Filename-time filter: {before} -> {len(items)} results "
             f"({file_time_start} to {file_time_end})"

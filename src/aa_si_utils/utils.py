@@ -21,6 +21,7 @@ import pandas as pd
 import xarray as xr
 
 from aa_si_utils import _storage
+from aa_si_utils.data_retrieval import filter_paths_by_file_time
 
 
 # Target number of pings per chunk along ``ping_time`` when writing the combined
@@ -279,7 +280,9 @@ def add_dive_profile_to_dataset(ds_MVBS, csv_filepath, dive_profile_name='dive_p
         ds_MVBS (xr.Dataset): MVBS dataset with ``ping_time`` coordinate.
         csv_filepath (str | Path): Path to dive profile CSV with columns:
             ``ClickTime_UTC``, ``clickDepth_m``, ``fit_line``,
-            ``lwr_CI_99``, ``upr_CI_99``.
+            ``lwr_CI_99``, ``upr_CI_99``. May be a remote fsspec URL
+            (``gs://...``), which pandas reads in place — these files are small,
+            so no local copy is made.
         dive_profile_name (str): Base name for the added variables
             (default: ``'dive_profile'``).
 
@@ -289,14 +292,24 @@ def add_dive_profile_to_dataset(ds_MVBS, csv_filepath, dive_profile_name='dive_p
         data exists.
     """
     # Validate file exists
-    csv_path = Path(csv_filepath)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Dive profile CSV not found: {csv_filepath}")
-    
-    print(f"Reading dive profile: {csv_path.name}")
-    
+    if _storage.is_remote(csv_filepath):
+        storage_options = _execution_storage_options()
+        fs = _storage.get_fs(csv_filepath, storage_options)
+        if not fs.exists(str(csv_filepath)):
+            raise FileNotFoundError(f"Dive profile CSV not found: {csv_filepath}")
+        csv_path = str(csv_filepath)
+        read_csv_kwargs = {"storage_options": storage_options or None}
+    else:
+        csv_path = Path(csv_filepath)
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Dive profile CSV not found: {csv_filepath}")
+        read_csv_kwargs = {}
+
+    csv_name = _storage.basename(csv_path)
+    print(f"Reading dive profile: {csv_name}")
+
     # Read CSV
-    dive_df = pd.read_csv(csv_path)
+    dive_df = pd.read_csv(csv_path, **read_csv_kwargs)
     dive_df['ClickTime_UTC'] = pd.to_datetime(dive_df['ClickTime_UTC'].str.replace('_', ' '))
     
     # Rename to 'time' for merge_asof
@@ -358,13 +371,13 @@ def add_dive_profile_to_dataset(ds_MVBS, csv_filepath, dive_profile_name='dive_p
     ds_MVBS[f'{dive_profile_name}_fit'].attrs.update({
         'long_name': 'Sperm whale dive depth (fitted)',
         'units': 'meters',
-        'source_file': csv_path.name
+        'source_file': csv_name
     })
     
     ds_MVBS[f'{dive_profile_name}_depth'].attrs.update({
         'long_name': 'Sperm whale dive depth (measured)',
         'units': 'meters',
-        'source_file': csv_path.name
+        'source_file': csv_name
     })
     
     ds_MVBS[f'{dive_profile_name}_lower_ci'].attrs.update({
@@ -964,11 +977,14 @@ def log_mask_stats(mask):
 
 
 def initial_setup_and_validation(raw_input_folder, calibration_outputs_string="calibration",
-                                  raw_file_names=None, clear_previous_json_logs=True):
+                                  raw_file_names=None, clear_previous_json_logs=True,
+                                  file_time_start=None, file_time_end=None):
     """Set up output folders, resolve raw file paths, and optionally clear previous logs.
 
     Args:
-        raw_input_folder: Path to the folder containing raw input files.
+        raw_input_folder: Path to the folder containing raw input files. May be a
+            local path or a remote fsspec URL (``gs://bucket/survey/raw``); a
+            remote folder is listed without downloading any data.
         calibration_outputs_string: Subdirectory name for calibration artifacts. When
             running inside the recipe executor this is resolved relative to the pipeline's
             user-facing outputs directory (``artifacts_dir`` from the execution context)
@@ -979,13 +995,22 @@ def initial_setup_and_validation(raw_input_folder, calibration_outputs_string="c
         raw_file_names: Optional list of specific raw file name strings to process.
             If empty or None, all .raw files in raw_input_folder are used.
         clear_previous_json_logs: If True, delete existing calibration_flags.json (default: True).
+        file_time_start: Optional inclusive lower bound (ISO string or datetime)
+            on the datetime encoded in each raw file's name
+            (``D{YYYYMMDD}-T{HHMMSS}``). Filtering is name-based, so remote
+            files are never opened or downloaded to apply it.
+        file_time_end: Optional inclusive upper bound; see *file_time_start*.
 
     Returns:
         dict with keys:
-            raw_file_paths: list[str] of absolute paths to raw acoustic files.
+            raw_file_paths: list[str] of absolute paths (or gs:// URLs) to raw
+                acoustic files.
             calibration_output_dir: str resolved full path to the calibration outputs folder.
     """
-    raw_input_folder = Path(raw_input_folder)
+    # Coerce only local values: Path() mangles a URL ("gs://b/x" -> "gs:/b/x").
+    raw_input_remote = _storage.is_remote(raw_input_folder)
+    if not raw_input_remote:
+        raw_input_folder = Path(raw_input_folder)
 
     # Resolve the calibration output directory relative to the pipeline outputs dir
     # when running inside the executor; fall back to CWD-relative when standalone.
@@ -1004,16 +1029,37 @@ def initial_setup_and_validation(raw_input_folder, calibration_outputs_string="c
 
     # Get list of raw files to process
     if raw_file_names is not None and len(raw_file_names) > 0:
-        raw_file_paths = [raw_input_folder / filename for filename in raw_file_names]
+        raw_file_paths = [
+            _storage.join(raw_input_folder, filename) for filename in raw_file_names
+        ]
+    elif raw_input_remote:
+        raw_file_paths = _storage.glob_url(
+            raw_input_folder, "*.raw", _execution_storage_options()
+        )
     else:
         raw_file_paths = sorted(raw_input_folder.glob("*.raw"))
 
     if not raw_file_paths:
         raise FileNotFoundError("No raw files found to process")
 
+    if file_time_start is not None or file_time_end is not None:
+        before = len(raw_file_paths)
+        raw_file_paths = filter_paths_by_file_time(
+            raw_file_paths, file_time_start, file_time_end
+        )
+        print(
+            f"  Filename-time filter: {before} -> {len(raw_file_paths)} raw file(s) "
+            f"({file_time_start} to {file_time_end})"
+        )
+        if not raw_file_paths:
+            raise FileNotFoundError(
+                "No raw files found to process within the filename-time window "
+                f"({file_time_start} to {file_time_end})"
+            )
+
     print(f"Found {len(raw_file_paths)} raw file(s) to process:")
     for path in raw_file_paths:
-        print(f"  - {path.name}")
+        print(f"  - {_storage.basename(path)}")
 
     # Ensure calibration log folder exists (parents=True also creates calibration_output_dir)
     if not calibration_logs_dir.exists():
@@ -1036,6 +1082,22 @@ def _execution_temp_dir():
     try:
         from aa_recipe_manager.executor.runtime_context import get_execution_context  # noqa: PLC0415
         return get_execution_context().temp_dir
+    except ImportError:
+        return None
+
+
+def _execution_storage_options():
+    """Return the pipeline's fsspec options for remote *input* paths, or None.
+
+    ``getattr`` keeps this working against recipe-manager versions predating the
+    ``storage_options`` context field; ``None`` then means "use ambient
+    credentials" (Application Default Credentials on GCP), which is the intended
+    default anyway.
+    """
+    try:
+        from aa_recipe_manager.executor.runtime_context import get_execution_context  # noqa: PLC0415
+        options = getattr(get_execution_context(), "storage_options", None)
+        return dict(options) if options else None
     except ImportError:
         return None
 
@@ -1096,12 +1158,60 @@ def _write_store_with_retry(write_fn, store_path, max_retries=3, base_delay=1.0)
     raise last_exc
 
 
+def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
+                     intermediate_format, store_dir, store_options, remote):
+    """Convert one *local* raw file and return its EchoData or store path.
+
+    Deliberately a module-level function taking explicit arguments (rather than
+    a closure over the caller's loop variables): this is the per-file unit that
+    a future ``map_over`` step will dispatch, and it must stay picklable for
+    the Dask/Prefect executors.
+    """
+    ed = ep.open_raw(local_raw_path, sonar_model=sonar_model,
+                     include_bot=include_bot, use_swap=use_swap)
+
+    if intermediate_format == "none":
+        return ed
+    if intermediate_format == "netcdf":
+        store_path = store_dir / f"{local_raw_path.stem}.nc"
+        ed.to_netcdf(save_path=store_path)
+        return str(store_path)
+
+    store_path = _storage.join(store_dir, f"{local_raw_path.stem}.zarr")
+    # Match the checkpoint writer exactly: zarr_format=2 and compress=False.
+    # Writing v3 encodes echopype's fixed-length UTF-32 string metadata
+    # with a v3 serializer the v2 checkpoint write cannot express
+    # ("Zarr format 2 arrays do not support serializer").  Leaving
+    # compression on makes echopype attach a zarr-v3 BloscCodec that a
+    # v2 write also rejects ("Invalid compressor ... Got BloscCodec");
+    # compress=False sidesteps it, consistent with the checkpoint store.
+    if remote:
+        # Object storage: no Windows rename-lock, so no retry wrapper;
+        # thread storage options so echopype writes to the bucket.
+        _storage.remove_store(store_path, store_options)
+        ed.to_zarr(save_path=str(store_path), zarr_format=2,
+                   compress=False,
+                   output_storage_options=store_options or {})
+    else:
+        _write_store_with_retry(
+            lambda: ed.to_zarr(save_path=store_path, zarr_format=2,
+                               compress=False),
+            store_path,
+        )
+    return str(store_path)
+
+
 def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=True,
                               intermediate_format="netcdf", use_swap="auto"):
     """Open raw sonar files and write each as an intermediate store.
 
     Args:
         raw_file_paths: List of string paths or Path objects pointing to raw files.
+            Entries may also be remote fsspec URLs (``gs://bucket/.../f.raw``).
+            Each remote file is downloaded to a private local scratch directory,
+            converted, and its local copy deleted before the next file is
+            fetched — local disk therefore holds at most one raw file at a time
+            (per concurrent instance), and bucket objects are never modified.
         sonar_model: Sonar model string for echopype (default: "EK60").
         include_bot: Whether to include .bot files (default: True).
         intermediate_format: ``"netcdf"`` (default), ``"zarr"``, or ``"none"``.
@@ -1154,41 +1264,30 @@ def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=Tru
             )
         _storage.makedirs(store_dir, store_options)
 
+    input_options = _execution_storage_options()
+    # echopype locates a .bot companion by swapping the raw file's extension,
+    # so it must be downloaded beside the raw file rather than passed in.
+    companions = (".bot",) if include_bot else ()
+
     results = []
     for raw_path in raw_file_paths:
-        raw_path = Path(raw_path)
-        ed = ep.open_raw(raw_path, sonar_model=sonar_model, include_bot=include_bot,
-                         use_swap=use_swap)
-
-        if intermediate_format == "none":
-            results.append(ed)
-        elif intermediate_format == "netcdf":
-            store_path = store_dir / f"{raw_path.stem}.nc"
-            ed.to_netcdf(save_path=store_path)
-            results.append(str(store_path))
+        if _storage.is_remote(raw_path):
+            with _storage.localized_file(
+                str(raw_path),
+                storage_options=input_options,
+                companion_suffixes=companions,
+            ) as local_raw:
+                # open_raw fully parses the file before returning, so nothing
+                # references the local copy once the context block exits.
+                results.append(_open_and_store(
+                    local_raw, sonar_model, include_bot, use_swap,
+                    intermediate_format, store_dir, store_options, remote,
+                ))
         else:
-            store_path = _storage.join(store_dir, f"{raw_path.stem}.zarr")
-            # Match the checkpoint writer exactly: zarr_format=2 and compress=False.
-            # Writing v3 encodes echopype's fixed-length UTF-32 string metadata
-            # with a v3 serializer the v2 checkpoint write cannot express
-            # ("Zarr format 2 arrays do not support serializer").  Leaving
-            # compression on makes echopype attach a zarr-v3 BloscCodec that a
-            # v2 write also rejects ("Invalid compressor ... Got BloscCodec");
-            # compress=False sidesteps it, consistent with the checkpoint store.
-            if remote:
-                # Object storage: no Windows rename-lock, so no retry wrapper;
-                # thread storage options so echopype writes to the bucket.
-                _storage.remove_store(store_path, store_options)
-                ed.to_zarr(save_path=str(store_path), zarr_format=2,
-                           compress=False,
-                           output_storage_options=store_options or {})
-            else:
-                _write_store_with_retry(
-                    lambda: ed.to_zarr(save_path=store_path, zarr_format=2,
-                                       compress=False),
-                    store_path,
-                )
-            results.append(str(store_path))
+            results.append(_open_and_store(
+                Path(raw_path), sonar_model, include_bot, use_swap,
+                intermediate_format, store_dir, store_options, remote,
+            ))
 
     print(f"Read {len(raw_file_paths)} raw file(s) to '{intermediate_format}' format")
     return results
