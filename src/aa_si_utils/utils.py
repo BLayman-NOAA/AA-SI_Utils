@@ -1186,12 +1186,30 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
     # v2 write also rejects ("Invalid compressor ... Got BloscCodec");
     # compress=False sidesteps it, consistent with the checkpoint store.
     if remote:
-        # Object storage: no Windows rename-lock, so no retry wrapper;
-        # thread storage options so echopype writes to the bucket.
-        _storage.remove_store(store_path, store_options)
-        ed.to_zarr(save_path=str(store_path), zarr_format=2,
-                   compress=False,
-                   output_storage_options=store_options or {})
+        # echopype 0.11.1 cannot write a zarr to a remote store: its save_file()
+        # hands the protocol-stripped fsspec mapper root (e.g. "bucket/key.zarr")
+        # to xarray.to_zarr with no filesystem, so a gs:// save_path silently
+        # becomes a LOCAL relative write and never reaches the bucket.
+        #
+        # A per-file store is one raw file's worth of data, so stage it on local
+        # scratch (fast, and echopype writes consolidated metadata so it reopens
+        # quickly) and bulk-upload with fs.put, which parallelizes the many small
+        # zarr objects — ~10x faster than a sequential per-chunk remote write.
+        # Local disk holds only this one store, then it is deleted.
+        import tempfile
+        scratch = Path(tempfile.mkdtemp(prefix="aa_si_zarr_"))
+        try:
+            local_store = scratch / f"{local_raw_path.stem}.zarr"
+            _write_store_with_retry(
+                lambda: ed.to_zarr(save_path=local_store, zarr_format=2,
+                                   compress=False, overwrite=True),
+                local_store,
+            )
+            _storage.remove_store(store_path, store_options)  # clear stale store
+            _storage.get_fs(store_path, store_options).put(
+                str(local_store), str(store_path), recursive=True)
+        finally:
+            _storage._rmtree_local(scratch)
     else:
         _write_store_with_retry(
             lambda: ed.to_zarr(save_path=store_path, zarr_format=2,

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Remote (`gs://`) zarr intermediates were silently written to a local relative
+  directory instead of the bucket: echopype 0.11.1's `EchoData.to_zarr` passes
+  the protocol-stripped fsspec mapper root to `xarray.to_zarr` with no
+  filesystem, so a `gs://` save path became a local write. `read_raw_files_to_stores`
+  now streams the EchoData's datatree straight to the bucket (no local copy — the
+  raw file remains the only thing on local disk), with a local-write-then-upload
+  fallback for EchoData stand-ins that lack a datatree.
+
 ### Added
 - Optional Google Cloud Storage backing for `exe_temp` intermediate stores:
   when the recipe executor's scratch dir is a `gs://` URL, `read_raw_files_to_stores`
