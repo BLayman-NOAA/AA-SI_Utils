@@ -85,8 +85,31 @@ def test_filter_inclusive_bounds():
 
 def test_filter_accepts_datetime_bounds():
     paths = [_RAW_A, _RAW_B, _RAW_C]
+    # A starts before 21:00 but records until B begins (21:05) — overlap keeps it.
     kept = filter_paths_by_file_time(paths, datetime(2016, 7, 25, 21, 0), None)
+    assert kept == [_RAW_A, _RAW_B, _RAW_C]
+
+
+def test_filter_includes_file_straddling_window_start():
+    paths = [_RAW_A, _RAW_B, _RAW_C]
+    # A (20:58:32) starts before the window but records until B starts
+    # (21:05:00), so it has in-window data and is kept.
+    kept = filter_paths_by_file_time(paths, "2016-07-25T21:00", "2016-07-25T21:30:00")
+    assert kept == [_RAW_A, _RAW_B, _RAW_C]
+
+
+def test_filter_excludes_file_ending_exactly_at_window_start():
+    paths = [_RAW_A, _RAW_B, _RAW_C]
+    # A's recording ends the instant B starts (21:05:00) — exactly at the
+    # window start — so A has no in-window data.
+    kept = filter_paths_by_file_time(paths, "2016-07-25T21:05:00", None)
     assert kept == [_RAW_B, _RAW_C]
+
+
+def test_filter_last_file_falls_back_to_own_stamp():
+    # The chronologically last file has no next stamp to bound its end, so
+    # only its own stamp decides: A alone, before the window, is excluded.
+    assert filter_paths_by_file_time([_RAW_A], "2016-07-25T21:00", None) == []
 
 
 def test_filter_excludes_unparseable_names_when_bounded():
@@ -97,10 +120,10 @@ def test_filter_excludes_unparseable_names_when_bounded():
 def test_filter_local_and_url_agree():
     local = [f"/data/{_RAW_A}", f"/data/{_RAW_B}"]
     urls = [f"memory://bkt/{_RAW_A}", f"memory://bkt/{_RAW_B}"]
-    local_kept = filter_paths_by_file_time(local, "2016-07-25T21:00", None)
-    url_kept = filter_paths_by_file_time(urls, "2016-07-25T21:00", None)
+    local_kept = filter_paths_by_file_time(local, None, "2016-07-25T21:00")
+    url_kept = filter_paths_by_file_time(urls, None, "2016-07-25T21:00")
     assert [Path(p).name for p in local_kept] == [_storage.basename(u) for u in url_kept]
-    assert local_kept == [f"/data/{_RAW_B}"]
+    assert local_kept == [f"/data/{_RAW_A}"]
 
 
 def test_filter_ignores_dir_stamp_uses_basename():
@@ -153,8 +176,11 @@ def test_initial_setup_remote_time_filter(tmp_path):
         result = utils.initial_setup_and_validation(
             "memory://survey/raw",
             file_time_start="2016-07-25T21:00",
+            file_time_end="2016-07-25T21:10",
         )
-    assert [_storage.basename(p) for p in result["raw_file_paths"]] == [_RAW_B, _RAW_C]
+    # A straddles the window start (records until B begins at 21:05);
+    # C starts after the window end.
+    assert [_storage.basename(p) for p in result["raw_file_paths"]] == [_RAW_A, _RAW_B]
 
 
 def test_initial_setup_empty_remote_folder_raises(tmp_path):

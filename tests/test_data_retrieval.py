@@ -173,6 +173,76 @@ def test_query_returns_json_safe_file_datetime(monkeypatch):
     json.dumps(result)
 
 
+def test_query_includes_file_straddling_window_start(monkeypatch):
+    monkeypatch.setattr(
+        dr,
+        "_fetch_all_pages",
+        lambda params: [
+            _make_record("D20160725-T130000.raw"),
+            _make_record("D20160725-T150000.raw"),
+        ],
+    )
+
+    result = dr.query_ncei_data(
+        file_time_start="2016-07-25T14:00",
+        file_time_end="2016-07-25T18:00",
+    )
+
+    # The 13:00 file records until the next file starts (15:00), so it has
+    # in-window data and is kept despite starting before the window.
+    names = [r["FILE_NAME"] for r in result["records"]]
+    assert names == ["D20160725-T130000.raw", "D20160725-T150000.raw"]
+
+
+def test_query_last_file_end_not_borrowed_across_datasets(monkeypatch):
+    def rec(filename, dataset):
+        record = _make_record(filename)
+        record["DATASET_NAME"] = dataset
+        return record
+
+    monkeypatch.setattr(
+        dr,
+        "_fetch_all_pages",
+        lambda params: [
+            rec("D20160725-T120000.raw", "dsA"),
+            rec("D20160725-T130000.raw", "dsA"),
+            rec("D20160725-T150000.raw", "dsB"),
+        ],
+    )
+
+    result = dr.query_ncei_data(
+        file_time_start="2016-07-25T14:00",
+        file_time_end="2016-07-25T18:00",
+    )
+
+    # dsA's 13:00 file is the last of its dataset: with no same-dataset
+    # successor its end is unknown, so it falls back to the own-stamp rule
+    # and is excluded — dsB's 15:00 stamp must not act as its end time.
+    names = [r["FILE_NAME"] for r in result["records"]]
+    assert names == ["D20160725-T150000.raw"]
+
+
+def test_query_widens_derived_collection_start(monkeypatch):
+    captured = {}
+
+    def fake_fetch(params):
+        captured["where"] = params["where"]
+        return []
+
+    monkeypatch.setattr(dr, "_fetch_all_pages", fake_fetch)
+
+    dr.query_ncei_data(file_time_start="2016-07-25T00:30")
+    # Widened one day so a previous-day file recording past midnight is
+    # fetched as a candidate for the overlap filter.
+    assert "COLLECTION_DATE >= DATE '2016-07-24'" in captured["where"]
+
+    dr.query_ncei_data(
+        file_time_start="2016-07-25T00:30", collection_start="2016-07-25"
+    )
+    # An explicit collection_start is respected untouched.
+    assert "COLLECTION_DATE >= DATE '2016-07-25'" in captured["where"]
+
+
 def test_download_creates_per_query_subfolder(monkeypatch, tmp_path):
     _install_fake_network(monkeypatch, body=b"fake raw bytes")
 

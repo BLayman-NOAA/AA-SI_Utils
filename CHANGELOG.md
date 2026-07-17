@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Filename-time filtering (`file_time_start` / `file_time_end`) missed raw
+  files that start before the window but record into it, because only each
+  file's own name stamp (its recording *start*) was compared against the
+  window. `query_ncei_data` and `filter_paths_by_file_time` now use overlap
+  semantics: a file's end time is inferred from the next file's start stamp
+  (within the same dataset for NCEI queries) and the file is kept when the
+  resulting span overlaps the window. The auto-derived server-side
+  `collection_start` is widened by one day so a straddling file from the
+  previous day is fetched as a candidate. The chronologically last file has no
+  inferred end and still uses the own-stamp rule.
 - Remote (`gs://`) zarr intermediates were silently written to a local relative
   directory instead of the bucket: echopype 0.11.1's `EchoData.to_zarr` passes
   the protocol-stripped fsspec mapper root to `xarray.to_zarr` with no

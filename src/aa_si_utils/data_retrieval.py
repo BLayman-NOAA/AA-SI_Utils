@@ -7,9 +7,8 @@ import json
 import os
 import re
 import tarfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-
 import requests
 
 
@@ -65,24 +64,55 @@ def _path_basename(path):
     return text.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
 
 
-def _in_time_window(file_datetime, file_time_start, file_time_end):
-    """Inclusive window test. Unparseable names (``None``) are excluded."""
-    if file_datetime is None:
+def _next_stamp_map(stamps):
+    """Map each stamp to the earliest strictly-later stamp in *stamps*.
+
+    Used to infer a file's end time: a raw file records from its own name
+    stamp until the next file begins. ``None`` stamps are ignored; the latest
+    stamp maps to ``None`` (no later file to bound it).
+    """
+    unique = sorted({s for s in stamps if s is not None})
+    return {
+        stamp: (unique[i + 1] if i + 1 < len(unique) else None)
+        for i, stamp in enumerate(unique)
+    }
+
+
+def _overlap_keep(stamp, next_stamp, start, end):
+    """Overlap window test for a file recording over ``[stamp, next_stamp)``.
+
+    A file is kept when the span it records overlaps the inclusive
+    ``[start, end]`` window, so a file that starts before *start* but records
+    into the window is included. Unparseable names (``None`` stamp) are
+    excluded. The chronologically last file (``next_stamp is None``) has an
+    unknown end, so it falls back to the point-in-window test on its own
+    stamp.
+    """
+    if stamp is None:
         return False
-    if file_time_start and file_datetime < file_time_start:
+    if end is not None and stamp > end:
         return False
-    if file_time_end and file_datetime > file_time_end:
-        return False
-    return True
+    if start is None or stamp >= start:
+        return True
+    # stamp < start: keep only when the next file proves the recording
+    # extends into the window (a file ending exactly at *start* has no
+    # in-window data).
+    return next_stamp is not None and next_stamp > start
 
 
 def filter_paths_by_file_time(paths, file_time_start=None, file_time_end=None):
-    """Filter raw-file paths by the datetime encoded in their file names.
+    """Filter raw-file paths by the time span inferred from their file names.
 
     Works on local paths and remote URLs (``gs://...``) alike: only the final
     path segment is inspected, so no file is opened or downloaded. Bounds are
-    inclusive and may be ISO strings or ``datetime`` objects. Names without a
-    parseable ``D{YYYYMMDD}-T{HHMMSS}`` stamp are excluded whenever a bound is
+    inclusive and may be ISO strings or ``datetime`` objects.
+
+    Each file's ``D{YYYYMMDD}-T{HHMMSS}`` name stamp is its recording *start*;
+    its end is inferred as the next file's stamp. A file is kept when that
+    span overlaps the window, so a file that starts before *file_time_start*
+    but records into the window is included. The chronologically last file
+    has no inferred end and is kept only when its own stamp falls inside the
+    window. Names without a parseable stamp are excluded whenever a bound is
     given, matching :func:`query_ncei_data`'s filtering semantics.
 
     Passing no bounds returns the paths unchanged.
@@ -93,7 +123,7 @@ def filter_paths_by_file_time(paths, file_time_start=None, file_time_end=None):
         file_time_end: Optional inclusive upper bound.
 
     Returns:
-        list: The subset of *paths* inside the window, order preserved.
+        list: The subset of *paths* overlapping the window, order preserved.
     """
     if file_time_start is None and file_time_end is None:
         return list(paths)
@@ -101,10 +131,14 @@ def filter_paths_by_file_time(paths, file_time_start=None, file_time_end=None):
     start = _coerce_datetime(file_time_start)
     end = _coerce_datetime(file_time_end)
 
+    paths = list(paths)
+    stamps = [parse_datetime_from_filename(_path_basename(p)) for p in paths]
+    next_stamps = _next_stamp_map(stamps)
+
     return [
         path
-        for path in paths
-        if _in_time_window(parse_datetime_from_filename(_path_basename(path)), start, end)
+        for path, stamp in zip(paths, stamps)
+        if _overlap_keep(stamp, next_stamps.get(stamp), start, end)
     ]
 
 
@@ -376,22 +410,6 @@ def _add_spatial_params(params, bbox=None, center_point=None, radius_nm=None):
         print(f"Spatial filter: {radius_nm} nm radius around ({lon}, {lat})")
 
 
-def _geometry_has_vertex_in_bbox(geometry, bbox):
-    """Return True when any ArcGIS polyline vertex falls within *bbox*."""
-    if not geometry or "paths" not in geometry:
-        return False
-
-    west, south, east, north = bbox
-    for path in geometry.get("paths", []):
-        for point in path:
-            if len(point) < 2:
-                continue
-            lon, lat = point[0], point[1]
-            if west <= lon <= east and south <= lat <= north:
-                return True
-    return False
-
-
 def _fetch_all_pages(params):
     """Paginate through the ArcGIS MapServer and return all attribute dicts."""
     all_items = []
@@ -413,7 +431,7 @@ def _fetch_all_pages(params):
         for feature in features:
             item = dict(feature["attributes"])
             if "geometry" in feature:
-                item["_WCSD_GEOMETRY"] = feature["geometry"]
+                item["GEOMETRY"] = feature["geometry"]
             all_items.append(item)
 
         if not data.get("exceededTransferLimit"):
@@ -535,6 +553,7 @@ def query_ncei_data(
     center_point=None,
     radius_nm=None,
     filters=None,
+    return_geometry=True,
 ):
     """Query the NOAA NCEI Water Column Sonar Data (WCSD) archive.
 
@@ -555,19 +574,24 @@ def query_ncei_data(
             granularity).
         collection_end (str | None): Inclusive end date as ``'YYYY-MM-DD'``.
         file_time_start (str | datetime | None): Inclusive start datetime for
-            fine-grained filtering.  Parsed from each filename's embedded
-            timestamp (``-DYYYYMMDD-THHMMSS``).  Accepts an ISO-format string
-            or a ``datetime`` object.
+            fine-grained filtering.  Each file's recording span is inferred
+            from the filename timestamps (``D{YYYYMMDD}-T{HHMMSS}``): its own
+            stamp is the recording start and the next file's stamp (within
+            the same dataset) is its end.  Files whose span overlaps the
+            window are kept, so a file that starts before this bound but
+            records into the window is included.  A dataset's last file has
+            no inferred end and is kept only when its own stamp is inside the
+            window.  Accepts an ISO-format string or a ``datetime`` object.
         file_time_end (str | datetime | None): Inclusive end datetime for
             fine-grained filtering (same format as *file_time_start*).
         max_files (int | None): Maximum number of results to return.  Applied
             after all other filters; results are sorted chronologically by
             filename timestamp.
         bbox (tuple | None): Bounding box ``(west, south, east, north)`` in
-            WGS 84 decimal degrees. Server-side filtering first uses ArcGIS
-            polyline/envelope intersection, then client-side filtering keeps
-            only files with at least one returned geometry vertex inside the
-            bbox.
+            WGS 84 decimal degrees. Applied server-side as an ArcGIS
+            envelope-intersection filter against each file's own track
+            polyline, so every file whose track passes through the box is
+            returned (including tracks that cross a corner between vertices).
         center_point (tuple | None): ``(longitude, latitude)`` for a
             radius-based spatial query.
         radius_nm (float | None): Search radius in nautical miles (requires
@@ -577,13 +601,22 @@ def query_ncei_data(
             in the query.  Use this for any WCSD attribute not covered by the
             explicit parameters above (e.g.
             ``{'CRUISE_NAME': 'DY2207', 'PLATFORM_NAME': 'Oscar Dyson (DY)'}``).
+        return_geometry (bool): Whether each record should include its track
+            ``GEOMETRY``. Defaults to ``True`` (the geometry adds negligible
+            query time). Set ``False`` to omit it and keep the returned
+            records / checkpoints smaller. Geometry is always returned for
+            spatial queries (``bbox`` or ``center_point``) regardless of this
+            flag.
 
     Returns:
         dict: A dict with two keys:
 
             - ``records`` (``list[dict]``): One entry per file. Each dict
               contains all WCSD attribute fields plus a ``FILE_DATETIME``
-              (``datetime`` or ``None``) parsed from the filename.
+              (``datetime`` or ``None``) parsed from the filename. Unless
+              ``return_geometry=False``, each dict also carries a ``GEOMETRY``
+              key holding the file's track polyline as an ArcGIS
+              ``{"paths": [[[lon, lat], ...]]}`` dict.
             - ``query_label`` (``str``): A readable, folder-safe slug derived
               from the query parameters (see :func:`build_query_label`).
               Useful for grouping downloads into per-query subfolders.
@@ -624,7 +657,10 @@ def query_ncei_data(
             if isinstance(file_time_start, str)
             else file_time_start
         )
-        collection_start = ft_start.strftime("%Y-%m-%d")
+        # Widen by one day: a file that starts late on the previous day can
+        # record into the window, and it must be fetched as a candidate for
+        # the overlap filter below to see it.
+        collection_start = (ft_start - timedelta(days=1)).strftime("%Y-%m-%d")
     if file_time_end is not None and collection_end is None:
         ft_end = (
             datetime.fromisoformat(file_time_end)
@@ -648,7 +684,7 @@ def query_ncei_data(
         "f": "json",
         "where": where_clause,
         "outFields": "*",
-        "returnGeometry": "true" if bbox is not None else "false",
+        "returnGeometry": "true" if (bbox is not None or return_geometry) else "false",
         "orderByFields": "FILE_NAME",
     }
 
@@ -663,35 +699,39 @@ def query_ncei_data(
         print(f"Network error: {exc}")
         return {"records": [], "query_label": query_label}
 
-    if bbox is not None:
-        before = len(items)
-        items = [
-            item
-            for item in items
-            if _geometry_has_vertex_in_bbox(item.get("_WCSD_GEOMETRY"), bbox)
-        ]
-        print(
-            f"  Geometry bbox filter: {before} -> {len(items)} results "
-            f"with at least one vertex inside bbox"
-        )
-
     # Enrich with FILE_DATETIME
     for item in items:
         item["FILE_DATETIME"] = _parse_datetime_from_filename(
             item.get("FILE_NAME", "")
         )
 
-    # Fine-grained filename-time filtering
+    # Fine-grained filename-time filtering (overlap semantics: a file's end
+    # time is inferred from the next file's start stamp)
     if file_time_start is not None or file_time_end is not None:
         file_time_start = _coerce_datetime(file_time_start)
         file_time_end = _coerce_datetime(file_time_end)
+
+        # Group stamps by dataset so the last file of one cruise never
+        # borrows its end time from another cruise's first file.
+        stamps_by_dataset = {}
+        for item in items:
+            stamps_by_dataset.setdefault(item.get("DATASET_NAME"), []).append(
+                item.get("FILE_DATETIME")
+            )
+        next_stamps = {
+            dataset: _next_stamp_map(stamps)
+            for dataset, stamps in stamps_by_dataset.items()
+        }
 
         before = len(items)
         items = [
             i
             for i in items
-            if _in_time_window(
-                i.get("FILE_DATETIME"), file_time_start, file_time_end
+            if _overlap_keep(
+                i.get("FILE_DATETIME"),
+                next_stamps[i.get("DATASET_NAME")].get(i.get("FILE_DATETIME")),
+                file_time_start,
+                file_time_end,
             )
         ]
         print(
@@ -709,7 +749,6 @@ def query_ncei_data(
         items = items[:max_files]
 
     for item in items:
-        item.pop("_WCSD_GEOMETRY", None)
         file_datetime = item.get("FILE_DATETIME")
         if isinstance(file_datetime, datetime):
             item["FILE_DATETIME"] = file_datetime.isoformat()

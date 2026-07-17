@@ -996,9 +996,12 @@ def initial_setup_and_validation(raw_input_folder, calibration_outputs_string="c
             If empty or None, all .raw files in raw_input_folder are used.
         clear_previous_json_logs: If True, delete existing calibration_flags.json (default: True).
         file_time_start: Optional inclusive lower bound (ISO string or datetime)
-            on the datetime encoded in each raw file's name
-            (``D{YYYYMMDD}-T{HHMMSS}``). Filtering is name-based, so remote
-            files are never opened or downloaded to apply it.
+            on each raw file's recording span. The span is inferred from the
+            ``D{YYYYMMDD}-T{HHMMSS}`` name stamps: a file's own stamp is its
+            start and the next file's stamp is its end, so a file that starts
+            before this bound but records into the window is kept. Filtering
+            is name-based, so remote files are never opened or downloaded to
+            apply it.
         file_time_end: Optional inclusive upper bound; see *file_time_start*.
 
     Returns:
