@@ -1474,4 +1474,36 @@ def check_for_seafloor_depth_data(ed):
     else:
         print("Warning: No bottom detection data found in the raw file. Sv effects not valid!")
         # raise ValueError("Error: No seafloor depth data found in the raw file. Sv effects not valid!")
-    
+
+
+def concat_datasets(datasets, dim="ping_time", **kwargs):
+    """Concatenate a list of xarray Datasets along a dimension.
+
+    Reconsolidation (fan-in) helper for the recipe system's ``collect``
+    pattern: a mapped step that produces one Dataset per data segment (e.g.
+    per-file MVBS) is gathered into a list, and this joins them back into one
+    Dataset along ``dim`` (default ``ping_time``).
+
+    A single Dataset (not a list) is returned unchanged so a ``map_over``
+    source that resolves to one item still works (single-item transparency).
+
+    Args:
+        datasets: A list of ``xarray.Dataset`` objects, or a single Dataset.
+        dim: Dimension to concatenate along. Defaults to ``"ping_time"``.
+        **kwargs: Forwarded to :func:`xarray.concat`.
+
+    Returns:
+        A single concatenated ``xarray.Dataset``.
+
+    Raises:
+        ValueError: If ``datasets`` is an empty collection.
+    """
+    if isinstance(datasets, xr.Dataset):
+        return datasets
+    items = [ds for ds in datasets if ds is not None]
+    if not items:
+        raise ValueError("concat_datasets received no datasets to merge")
+    if len(items) == 1:
+        return items[0]
+    return xr.concat(items, dim=dim, **kwargs)
+
