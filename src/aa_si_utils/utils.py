@@ -1239,28 +1239,30 @@ def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=Tru
             ``"none"`` returns in-memory EchoData objects without writing any
             files.
 
-            **Recommended options are ``"netcdf"`` and ``"none"``.**
+            Pick by where the intermediates must live:
 
-            ``"netcdf"`` is the default and the most reliable choice: each raw
-            file is written to a temporary ``.nc`` file, then reopened and
-            combined by ``combine_raw_stores``.  After combining, all groups
-            are rechunked to a single uniform chunk so the downstream zarr v2
-            checkpoint write (``combine_raw`` step with ``checkpoint: always``)
-            always succeeds.
+            ``"netcdf"`` is the default and the simplest choice for a *local*
+            temp dir: each raw file is written to a temporary ``.nc`` file, then
+            reopened and combined by ``combine_raw_stores``.  After combining,
+            all groups are rechunked to a single uniform chunk so the downstream
+            zarr v2 checkpoint write (``combine_raw`` step with
+            ``checkpoint: always``) always succeeds.  HDF5 needs seekable
+            writes, so netcdf **cannot** target object storage — a remote temp
+            dir raises.
 
             ``"none"`` keeps every ``EchoData`` object in memory without
             touching disk.  Suitable when the full dataset fits comfortably in
             RAM.
 
-            ``"zarr"`` is available for experimentation but is **not
-            recommended** in the current workflow.  The zarr v3 intermediate
-            stores use serializer-backed dtypes that are incompatible with the
-            zarr v2 checkpoint writer used for ``EchoData`` checkpoints.  Using
-            ``"zarr"`` will reproduce the error::
-
-                Zarr format 2 arrays do not support `serializer`.
-
-            Use ``"netcdf"`` or ``"none"`` instead.
+            ``"zarr"`` is the option for surveys too large to stage locally: it
+            is the only format that can write intermediates to a bucket, so a
+            ``gs://`` temp dir requires it.  Stores are written with
+            ``zarr_format=2`` and ``compress=False`` to match the checkpoint
+            writer exactly; that is what avoids the v3-serializer and
+            v3-BloscCodec errors a default ``to_zarr`` would trigger on the
+            downstream v2 checkpoint write (see ``_open_and_store``).  Remote
+            stores are staged to local scratch and bulk-uploaded, so local disk
+            still holds only one store at a time (per concurrent instance).
         use_swap: Passed to ``ep.open_raw`` as ``use_swap`` (default: ``"auto"``).
 
     Returns:
@@ -1321,6 +1323,15 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
         raw_stores: List of store path strings (zarr/netcdf) produced by
             ``read_raw_files_to_stores``, or a list of in-memory EchoData
             objects (for ``intermediate_format="none"`` mode).
+
+            A **list of such lists** is also accepted and flattened one level.
+            That is the shape a ``collect`` fan-in produces when the read step
+            is parallelized with ``map_over``: each mapped instance reads one
+            raw file and returns a one-element list, so the collected value is
+            ``[[store_0], [store_1], ...]``. Accepting both shapes lets the same
+            recipe step serve the whole-survey and per-file-parallel forms.
+            Order is preserved, which matters because ``ep.combine_echodata``
+            expects its inputs in time order.
         ping_time_chunk: Target chunk length along ``ping_time`` for the combined
             object (default: ``DEFAULT_PING_TIME_CHUNK``).  Controls the chunking
             of the downstream zarr checkpoint.
@@ -1330,6 +1341,19 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
     """
     if not raw_stores:
         raise ValueError("No raw stores provided")
+
+    # Flatten one level of nesting (see the map_over/collect note above). Only
+    # genuine sequences are unwrapped: str/Path and EchoData pass through.
+    if any(isinstance(entry, (list, tuple)) for entry in raw_stores):
+        flattened = []
+        for entry in raw_stores:
+            if isinstance(entry, (list, tuple)):
+                flattened.extend(entry)
+            else:
+                flattened.append(entry)
+        raw_stores = flattened
+        if not raw_stores:
+            raise ValueError("No raw stores provided")
 
     # Remote (bucket-backed) stores need storage options to open. The store
     # strings are opaque, so recover the options from the same exe_temp scratch
