@@ -77,6 +77,34 @@ def test_get_closest_index_for_depth_supports_chunked_data():
     assert range_sample_index == 2
 
 
+def test_get_closest_index_for_depth_ignores_nan_padding():
+    """echo_range is NaN-padded at depth when channels have differing sample
+    counts. The closest-depth lookup must skip the NaNs rather than returning
+    the first NaN index (which propagates a NaN aspect ratio into plotting).
+    """
+    ds_Sv = _make_ds_sv()
+    # Blank out the deepest sample of channel 0 (index 0) at every ping,
+    # mirroring the multi-channel padding seen in real combined Sv data.
+    echo_range = ds_Sv["echo_range"].copy()
+    echo_range.loc[dict(channel="38000", range_sample=3)] = np.nan
+    ds_Sv["echo_range"] = echo_range
+
+    # Shallow target: the true closest valid sample, not the NaN at index 3.
+    assert utils.get_closest_index_for_depth(ds_Sv, 5.0) == 0
+    # Deep target beyond the last valid depth: clamps to the deepest non-NaN.
+    assert utils.get_closest_index_for_depth(ds_Sv, 500.0) == 2
+
+
+def test_get_closest_index_for_depth_all_nan_raises():
+    ds_Sv = _make_ds_sv()
+    echo_range = ds_Sv["echo_range"].copy()
+    echo_range.loc[dict(channel="38000")] = np.nan
+    ds_Sv["echo_range"] = echo_range
+
+    with pytest.raises(ValueError, match="entirely NaN"):
+        utils.get_closest_index_for_depth(ds_Sv, 10.0)
+
+
 def test_find_data_depth_range_supports_chunked_data():
     pytest.importorskip("dask.array")
     ds_Sv = _make_ds_sv()
@@ -178,6 +206,42 @@ def test_combine_masks_validates_boolean_inputs_and_combines_masks():
         assert "boolean dtype" in str(exc)
     else:
         raise AssertionError("combine_masks should reject non-boolean inputs")
+
+
+def test_apply_mask_to_sv_matches_between_chunked_and_eager_input():
+    """apply_mask_to_sv used to eagerly `.compute()` Sv/mask/coords before
+    calling echopype's apply_mask. That was removed after confirming
+    echopype's apply_mask handles dask-backed input correctly on its own;
+    this locks in that both paths agree and that chunking survives through.
+    """
+    pytest.importorskip("dask.array")
+    ds_Sv = _make_ds_sv()
+    mask = utils.create_surface_mask(ds_Sv, surface_depth_m=10.0)
+
+    eager_result = utils.apply_mask_to_sv(ds_Sv.copy(deep=True), mask, fill_value=np.nan)
+
+    ds_Sv_chunked = ds_Sv.chunk({"ping_time": 1, "range_sample": 2})
+    mask_chunked = mask.chunk({"ping_time": 1, "range_sample": 2})
+    chunked_result = utils.apply_mask_to_sv(ds_Sv_chunked, mask_chunked, fill_value=np.nan)
+
+    assert chunked_result["Sv"].chunks is not None
+    xr.testing.assert_allclose(chunked_result["Sv"].compute(), eager_result["Sv"])
+
+
+def test_rechunk_dataset_sets_ping_time_chunk_size():
+    """rechunk_dataset is a standalone step rather than a parameter on any
+    particular masking/reduction op, so chunking a recipe needs doesn't
+    depend on which step happens to run immediately before the op that
+    wants to run dask-parallel.
+    """
+    pytest.importorskip("dask.array")
+    ds_Sv = _make_ds_sv()
+
+    result = utils.rechunk_dataset(ds_Sv, ping_time_chunk=2)
+
+    assert result["Sv"].chunks is not None
+    assert result["Sv"].chunks[result["Sv"].dims.index("ping_time")] == (2, 1)
+    xr.testing.assert_allclose(result["Sv"].compute(), ds_Sv["Sv"])
 
 
 def test_create_data_mask_matches_pure_mask_composition():

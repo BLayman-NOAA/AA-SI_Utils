@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import requests
 
+from aa_si_utils.raw_file_times import last_ping_time
+
 
 # Constants
 
@@ -100,20 +102,62 @@ def _overlap_keep(stamp, next_stamp, start, end):
     return next_stamp is not None and next_stamp > start
 
 
-def filter_paths_by_file_time(paths, file_time_start=None, file_time_end=None):
+def _boundary_stamp(stamps, start):
+    """Stamp of the newest file starting before *start*, or None.
+
+    That file is the only one whose name-based verdict rests on the inferred
+    end time: every earlier file is bounded by another file that still starts
+    before the window, so the heuristic already excludes it.
+    """
+    earlier = [s for s in stamps if s is not None and s < start]
+    return max(earlier) if earlier else None
+
+
+def _verified_keep(path, start, name_based, storage_options, verbose=True):
+    """Byte-accurate keep decision for a file that starts before *start*.
+
+    Falls back to *name_based* when the file's last ping cannot be read, since
+    over-including a file is easier to spot than silently dropping data.
+    """
+    last_ping = last_ping_time(path, storage_options=storage_options)
+    if last_ping is None:
+        if verbose:
+            print(
+                f"  Could not read last ping from {_path_basename(path)}; "
+                f"keeping the filename-based decision ({name_based})"
+            )
+        return name_based
+    return last_ping >= start
+
+
+def filter_paths_by_file_time(
+    paths,
+    file_time_start=None,
+    file_time_end=None,
+    verify_boundary=True,
+    storage_options=None,
+    verbose=True,
+):
     """Filter raw-file paths by the time span inferred from their file names.
 
     Works on local paths and remote URLs (``gs://...``) alike: only the final
-    path segment is inspected, so no file is opened or downloaded. Bounds are
-    inclusive and may be ISO strings or ``datetime`` objects.
+    path segment is inspected. Bounds are inclusive and may be ISO strings or
+    ``datetime`` objects.
 
     Each file's ``D{YYYYMMDD}-T{HHMMSS}`` name stamp is its recording *start*;
-    its end is inferred as the next file's stamp. A file is kept when that
-    span overlaps the window, so a file that starts before *file_time_start*
-    but records into the window is included. The chronologically last file
-    has no inferred end and is kept only when its own stamp falls inside the
-    window. Names without a parseable stamp are excluded whenever a bound is
-    given, matching :func:`query_ncei_data`'s filtering semantics.
+    its end is inferred as the next file's stamp. A file is kept when that span
+    overlaps the window, so a file that starts before *file_time_start* but
+    records into the window is included. Names without a parseable stamp are
+    excluded whenever a bound is given, matching :func:`query_ncei_data`'s
+    filtering semantics.
+
+    That inferred end assumes recording ran continuously from one file to the
+    next, which breaks across a gap between survey legs: the last file before
+    the gap looks like it records for the whole gap. So the one file whose
+    verdict depends on it has its real end read from the file itself, which
+    also settles the chronologically last file, whose end the names cannot
+    bound at all. At most one file per call is opened, and only its datagram
+    headers are read.
 
     Passing no bounds returns the paths unchanged.
 
@@ -121,6 +165,11 @@ def filter_paths_by_file_time(paths, file_time_start=None, file_time_end=None):
         paths: Iterable of path-like values or URL strings.
         file_time_start: Optional inclusive lower bound.
         file_time_end: Optional inclusive upper bound.
+        verify_boundary: When True (default), read the boundary file's last
+            ping instead of trusting the inferred end. Set False to keep the
+            filter name-only, e.g. for paths that are not reachable.
+        storage_options: fsspec options used to read a remote boundary file.
+        verbose: Print a note when a boundary file cannot be read.
 
     Returns:
         list: The subset of *paths* overlapping the window, order preserved.
@@ -134,12 +183,20 @@ def filter_paths_by_file_time(paths, file_time_start=None, file_time_end=None):
     paths = list(paths)
     stamps = [parse_datetime_from_filename(_path_basename(p)) for p in paths]
     next_stamps = _next_stamp_map(stamps)
-
-    return [
-        path
-        for path, stamp in zip(paths, stamps)
-        if _overlap_keep(stamp, next_stamps.get(stamp), start, end)
+    kept = [
+        _overlap_keep(stamp, next_stamps.get(stamp), start, end) for stamp in stamps
     ]
+
+    if start is not None and verify_boundary:
+        boundary = _boundary_stamp(stamps, start)
+        if boundary is not None:
+            for i, stamp in enumerate(stamps):
+                if stamp == boundary:
+                    kept[i] = _verified_keep(
+                        paths[i], start, kept[i], storage_options, verbose
+                    )
+
+    return [path for path, keep in zip(paths, kept) if keep]
 
 
 def _validate_string_value(value, param_name):

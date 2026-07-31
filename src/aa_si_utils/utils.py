@@ -32,6 +32,10 @@ from aa_si_utils.data_retrieval import filter_paths_by_file_time
 # for smaller per-chunk transfers, up for fewer/larger reads.
 DEFAULT_PING_TIME_CHUNK = 1000
 
+# Depth Echoview writes into a line file for a ping where no bottom was found.
+# Treated as a hole in the line rather than a 10 km deep seafloor.
+ECHOVIEW_NAN_DEPTH_VALUE = -10000.99
+
 
 def _computed_values(data):
     """Return NumPy values, explicitly computing lazy xarray/dask inputs."""
@@ -68,10 +72,18 @@ def get_closest_index_for_depth(sv_data, target_depth):
     echo_range_1d = sv_data['echo_range'].isel(ping_time=0, channel=0)
 
     # Calculate the absolute difference
-    depth_diff = np.abs(echo_range_1d - target_depth)
+    depth_diff = _computed_values(np.abs(echo_range_1d - target_depth))
 
-    # Find the index of the minimum difference
-    range_sample_index = int(np.argmin(_computed_values(depth_diff)))
+    # echo_range is NaN-padded at depth when channels have differing sample
+    # counts (multi-channel Sv combined onto a shared range_sample axis).  Plain
+    # np.argmin would return the index of the first NaN rather than the closest
+    # valid depth, so ignore NaNs here.
+    if np.all(np.isnan(depth_diff)):
+        raise ValueError(
+            "echo_range at ping_time=0, channel=0 is entirely NaN; "
+            "cannot resolve a range_sample index for the target depth"
+        )
+    range_sample_index = int(np.nanargmin(depth_diff))
 
     # Get the actual depth at that index
     actual_depth = _computed_item(echo_range_1d.isel(range_sample=range_sample_index))
@@ -172,7 +184,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return distance * 1000
 
 
-def mask_sparse_bins(ds_Sv: xr.Dataset, 
+def mask_sparse_bins(ds_Sv: xr.Dataset,
                       range_bin: str = "2m",
                       ping_time_bin: str = "10s",
                       nan_threshold: float = 0.8,
@@ -244,6 +256,24 @@ def mask_sparse_bins(ds_Sv: xr.Dataset,
     ds_result = ds_Sv.copy(deep=True)
     ds_result["Sv"].values = sv_values
     return ds_result
+
+
+def rechunk_dataset(ds_Sv: xr.Dataset, ping_time_chunk: int) -> xr.Dataset:
+    """Rechunk a Dataset along ping_time.
+
+    A standalone step rather than a parameter on any particular masking or
+    reduction op, so a recipe can insert (or remove) chunking wherever a
+    downstream op should run dask-parallel, independent of which step
+    happens to run immediately before it.
+
+    Args:
+        ds_Sv: Dataset to rechunk.
+        ping_time_chunk: Target chunk size along ping_time.
+
+    Returns:
+        xr.Dataset: *ds_Sv* rechunked along ping_time.
+    """
+    return ds_Sv.chunk({"ping_time": ping_time_chunk})
 
 
 def generate_colors(hue_offset, num_additional_colors):
@@ -499,6 +529,150 @@ def _validate_boolean_mask(mask, mask_name):
         raise TypeError(f"{mask_name} must have boolean dtype")
 
 
+def _drop_keel_offset(platform):
+    """Single drop keel offset in metres from a Platform group."""
+    if "drop_keel_offset" not in platform:
+        raise KeyError(
+            "Platform group has no 'drop_keel_offset'. Only EK80-family files "
+            "record one; pass a constant depth_offset to add_depth instead."
+        )
+
+    values = np.atleast_1d(_computed_values(platform["drop_keel_offset"])).astype(float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        raise ValueError(
+            "Platform 'drop_keel_offset' is NaN, so transducer depth cannot be "
+            "derived from it. The raw file's Environment datagram carried no "
+            "DropKeelOffset."
+        )
+    if not np.allclose(finite, finite[0]):
+        raise ValueError(
+            "Platform 'drop_keel_offset' holds more than one value "
+            f"({sorted(set(finite.tolist()))} m), so no single keel position "
+            "describes this data. Combine only files recorded with the keel at "
+            "one position, or compute depth per file before combining."
+        )
+    return float(finite[0])
+
+
+def _heave_on_ping_time(platform, ping_time, interp_method):
+    """Platform heave in metres on ping_time, or None when it carries no signal."""
+    if "vertical_offset" not in platform:
+        return None
+
+    heave = platform["vertical_offset"]
+    if len(heave.dims) != 1:
+        return None
+
+    time_dim = heave.dims[0]
+    if time_dim in heave.coords:
+        heave = heave.where(heave[time_dim].notnull(), drop=True)
+    heave = heave.dropna(dim=time_dim)
+    if heave.sizes[time_dim] == 0:
+        return None
+    if heave.sizes[time_dim] == 1:
+        return xr.full_like(ping_time, _computed_item(heave[0]), dtype=float)
+
+    aligned = heave.interp({time_dim: ping_time}, method=interp_method)
+    # interp leaves the source time as a stray non-dimension coordinate, which
+    # would otherwise ride along into ds_Sv['depth'].
+    return aligned.drop_vars(time_dim, errors="ignore")
+
+
+def compute_transducer_depth(
+    echodata,
+    ds_Sv,
+    datum_correction_m=0.0,
+    use_heave=True,
+    heave_sign=1.0,
+    interp_method="linear",
+):
+    """Per-ping transducer depth (m below surface) from the EK Platform group.
+
+    Built from ``drop_keel_offset`` rather than from echopype's own platform
+    vertical offsets. On a drop keel vessel the transducers ride on a
+    retractable keel and ``drop_keel_offset`` records how far it was lowered,
+    while the ``transducer_offset_z`` and ``water_level`` fields that
+    ``add_depth(use_platform_vertical_offsets=True)`` reads are often left at
+    zero. echopype carries ``drop_keel_offset`` for provenance and never reads
+    it, so pass this result to ``add_depth`` as ``depth_offset``.
+
+    The keel position is per file and heave is per ping, giving
+    ``drop_keel_offset + datum_correction_m + heave_sign * vertical_offset``.
+    Heave is interpolated onto ``ds_Sv``'s ping_time here so that add_depth
+    passes the result straight through instead of resampling it again with
+    nearest neighbour.
+
+    Args:
+        echodata (EchoData): Source EchoData supplying the Platform group.
+        ds_Sv (xr.Dataset): Sv dataset supplying the target ``ping_time``.
+        datum_correction_m (float): Metres added to ``drop_keel_offset`` to
+            reach depth below the water surface, for when the recorded offset
+            is measured from a hull datum rather than the waterline. Positive
+            pushes the transducer deeper.
+        use_heave (bool): Add the per-ping ``vertical_offset`` (heave) term.
+            False holds the static keel depth on every ping.
+        heave_sign (float): Sign applied to ``vertical_offset``. The default
+            ``1.0`` was determined empirically on HB2407 (EK80, Henry B.
+            Bigelow) by correlating raw heave against the hand-verified EVL
+            seabed line: combining EVL depth with a heave_sign=+1 transducer
+            depth left a residual std of 0.14 m against 0.75 m for -1.0, a
+            5x difference (see AA-SI_recipe_manager/example_recipes/HB2407).
+            echopype's own platform-vertical-offsets formula uses -1.0, but
+            that formula is referenced from transducer_offset_z/water_level
+            (a hull datum), not drop_keel_offset, so there is no reason to
+            expect the same sign to carry over — re-verify on new
+            vessels/instrument setups the same way rather than assuming.
+        interp_method (str): Interpolation used to put heave on ``ping_time``.
+
+    Returns:
+        xr.DataArray: Transducer depth in metres, dims ``("ping_time",)``,
+        named ``transducer_depth``.
+    """
+    platform = echodata["Platform"]
+    keel_offset = _drop_keel_offset(platform)
+    static_depth = keel_offset + datum_correction_m
+    ping_time = ds_Sv["ping_time"]
+
+    heave = None
+    if use_heave:
+        heave = _heave_on_ping_time(platform, ping_time, interp_method)
+
+    if heave is None:
+        depth = xr.full_like(ping_time, static_depth, dtype=float)
+        heave_pings = 0
+        if use_heave:
+            print(
+                "[transducer_depth] Platform group carries no usable heave; "
+                "holding the static keel depth on every ping"
+            )
+    else:
+        heave_pings = int(np.isfinite(_computed_values(heave)).sum())
+        # Pings outside the heave record fall back to the static depth rather
+        # than to NaN, which would void every sample of those pings downstream.
+        depth = static_depth + heave_sign * heave.fillna(0.0)
+
+    depth = depth.rename("transducer_depth").assign_coords(ping_time=ping_time)
+    depth.attrs = {
+        "long_name": "Transducer depth below water surface",
+        "units": "m",
+        "drop_keel_offset": keel_offset,
+        "datum_correction_m": float(datum_correction_m),
+        "heave_sign": float(heave_sign),
+        "heave_pings": heave_pings,
+        "interp_method": interp_method,
+    }
+
+    values = _computed_values(depth)
+    print(
+        f"[transducer_depth] drop_keel_offset {keel_offset} m "
+        f"{datum_correction_m:+g} m correction, heave on "
+        f"{heave_pings}/{ping_time.size} pings, "
+        f"depth {np.nanmin(values):.2f} to {np.nanmax(values):.2f} m"
+    )
+    return depth
+
+
 def get_transducer_depth(ds_Sv):
     """Per-ping transducer depth (m below surface) from a depth-enriched Sv ds.
 
@@ -556,6 +730,302 @@ def detect_seafloor(ds_Sv=None, echodata=None, channel=None, min_valid_depth_m=1
         seafloor_line = seafloor_line + get_transducer_depth(ds_Sv)
 
     return seafloor_line
+
+
+def _read_evl_text(evl_path):
+    """Return the text of a local or remote ``.evl`` file.
+
+    Decoded as utf-8-sig because Echoview writes a BOM. Line files are small
+    (tens of thousands of points, a couple of MB), so a remote one is read in
+    place rather than copied to local scratch.
+    """
+    if _storage.is_remote(evl_path):
+        storage_options = _execution_storage_options()
+        fs = _storage.get_fs(evl_path, storage_options)
+        if not fs.exists(str(evl_path)):
+            raise FileNotFoundError(f"EVL line file not found: {evl_path}")
+        with fs.open(str(evl_path), "rt", encoding="utf-8-sig") as handle:
+            return handle.read()
+
+    path = Path(evl_path)
+    if not path.exists():
+        raise FileNotFoundError(f"EVL line file not found: {evl_path}")
+    return path.read_text(encoding="utf-8-sig")
+
+
+def _parse_evl(evl_path):
+    """Parse an Echoview ``.evl`` line file into a time/depth/status DataFrame.
+
+    The format is two header lines — ``EVBD <format_version> <echoview_version>``
+    and the point count — followed by one point per line:
+
+        ``CCYYMMDD HHmmSSssss <depth_m> <status>``
+
+    The time-of-day field carries four fractional digits (1/10000 s), which
+    ``%f`` reads as microseconds after right-padding. The declared point count
+    is checked against the rows actually present, so a truncated export fails
+    here rather than silently producing a short line.
+
+    Args:
+        evl_path (str | Path): Path or fsspec URL of the ``.evl`` file.
+
+    Returns:
+        pd.DataFrame: Columns ``time`` (datetime64), ``depth`` (float, metres,
+        with the ``-10000.99`` "no bottom" sentinel replaced by NaN), and
+        ``status`` (numeric: 0 none, 1 unverified, 2 bad, 3 good).
+    """
+    file_lines = _read_evl_text(evl_path).splitlines()
+    if len(file_lines) < 2:
+        raise ValueError(
+            f"EVL file is missing its two header lines: {evl_path}"
+        )
+
+    try:
+        declared_points = int(file_lines[1].strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"EVL file's second line should be the point count, got "
+            f"{file_lines[1].strip()!r}: {evl_path}"
+        ) from exc
+
+    rows = [line.split() for line in file_lines[2:] if line.strip()]
+    if len(rows) != declared_points:
+        raise ValueError(
+            f"EVL file declares {declared_points} points but contains "
+            f"{len(rows)}: {evl_path}"
+        )
+    if not rows:
+        raise ValueError(f"EVL file contains no line points: {evl_path}")
+
+    widths = {len(row) for row in rows}
+    if widths != {4}:
+        raise ValueError(
+            f"EVL point lines should have 4 fields (date, time, depth, status); "
+            f"found rows with {sorted(widths)} fields: {evl_path}"
+        )
+
+    fields = pd.DataFrame(rows, columns=["date", "time_of_day", "depth", "status"])
+    depth = fields["depth"].astype("float64")
+    return pd.DataFrame(
+        {
+            "time": pd.to_datetime(
+                fields["date"] + " " + fields["time_of_day"],
+                format="%Y%m%d %H%M%S%f",
+            ),
+            "depth": depth.mask(depth == ECHOVIEW_NAN_DEPTH_VALUE),
+            "status": pd.to_numeric(fields["status"], errors="coerce"),
+        }
+    )
+
+
+def _tolerance_ns(seconds):
+    """Nanoseconds for a tolerance in seconds; ``None`` means "no limit"."""
+    if seconds is None:
+        return np.iinfo(np.int64).max
+    return np.int64(round(float(seconds) * 1_000_000_000))
+
+
+def _interp_line_to_ping_time(points, ping_time, max_gap_s, edge_extend_s):
+    """Interpolate line points onto a ping_time coordinate, linearly in time.
+
+    Args:
+        points (pd.DataFrame): Line points sorted by ``time``, with unique
+            timestamps and a ``depth`` column in metres.
+        ping_time (xr.DataArray): Target ping times.
+        max_gap_s (float | None): Widest hole in the line to interpolate across.
+        edge_extend_s (float | None): How far past the line's first/last point
+            to hold that point's depth.
+
+    Returns:
+        np.ndarray: Depths shaped like ``ping_time``, NaN wherever the line
+        does not support a value.
+    """
+    line_ns = points["time"].to_numpy(dtype="datetime64[ns]").astype("int64")
+    line_depth = points["depth"].to_numpy(dtype="float64")
+    ping_ns = np.asarray(ping_time).astype("datetime64[ns]").astype("int64")
+
+    # Linear between the bracketing points, clamped to the end values outside
+    # the line's span. A NaN line depth propagates only to the pings it
+    # brackets, which is the wanted "bottom unknown here".
+    values = np.interp(ping_ns, line_ns, line_depth)
+
+    # Nanoseconds a ping sits beyond the line's span; <= 0 while inside it.
+    outside_ns = np.maximum(line_ns[0] - ping_ns, ping_ns - line_ns[-1])
+    values[outside_ns > _tolerance_ns(edge_extend_s)] = np.nan
+
+    if max_gap_s is not None and line_ns.size > 1:
+        # Interior pings: drop those whose two bracketing line points are
+        # further apart in time than the limit. A ping landing exactly on a
+        # line point keeps that point's depth -- it is measured, not guessed,
+        # so the gap on either side of it is irrelevant.
+        left = np.clip(
+            np.searchsorted(line_ns, ping_ns, side="right") - 1,
+            0,
+            line_ns.size - 2,
+        )
+        bracket_ns = line_ns[left + 1] - line_ns[left]
+        on_line_point = (line_ns[left] == ping_ns) | (line_ns[left + 1] == ping_ns)
+        interpolated = (outside_ns <= 0) & ~on_line_point
+        values[interpolated & (bracket_ns > _tolerance_ns(max_gap_s))] = np.nan
+
+    return values
+
+
+def _log_seafloor_line_summary(points, ping_time, values, evl_path):
+    """Print line/ping alignment stats; return the covered fraction of pings."""
+    n_pings = values.size
+    n_filled = int(np.isfinite(values).sum())
+    coverage = n_filled / n_pings if n_pings else 0.0
+    ping_values = np.asarray(ping_time)
+
+    print(f"Seafloor line: {_storage.basename(evl_path)}")
+    print(
+        f"  Line points: {len(points)} spanning "
+        f"{points['time'].iloc[0]} to {points['time'].iloc[-1]}"
+    )
+    if n_pings:
+        print(
+            f"  Pings: {n_pings} spanning {ping_values.min()} to {ping_values.max()}"
+        )
+    print(
+        f"  Coverage: {n_filled}/{n_pings} pings ({coverage:.1%}) have a seafloor depth"
+    )
+    if n_filled:
+        print(
+            f"  Depth: min={np.nanmin(values):.1f} m, "
+            f"median={np.nanmedian(values):.1f} m, max={np.nanmax(values):.1f} m"
+        )
+    if coverage < 1.0:
+        print(
+            "  WARNING: create_seafloor_mask drops a ping entirely where the "
+            "seafloor is NaN (the comparison is False for every sample). Widen "
+            "edge_extend_s / max_gap_s, or use a line covering more of the survey."
+        )
+    return coverage
+
+
+def read_seafloor_line_evl(
+    ds_Sv,
+    evl_path,
+    vertical_reference="surface",
+    min_status=None,
+    max_gap_s=None,
+    edge_extend_s=0.0,
+    depth_offset_m=0.0,
+    min_coverage=0.0,
+):
+    """Read an Echoview ``.evl`` seafloor line onto ``ds_Sv``'s ping grid.
+
+    Drop-in replacement for :func:`detect_seafloor`: returns the same 1-D
+    ``(ping_time,)`` line in metres, on ``ds_Sv``'s exact ``ping_time``
+    coordinate, so :func:`create_seafloor_mask` consumes it unchanged. Use it
+    when a hand-verified Echoview bottom line is more trustworthy than running
+    detection.
+
+    Pings the line does not cover are NaN, and :func:`create_seafloor_mask`
+    rejects **every sample** of a ping whose seafloor is NaN (the metres-vs-metres
+    comparison is False against NaN). Coverage is therefore printed on every
+    call, and ``min_coverage`` turns a shortfall into an error.
+
+    Args:
+        ds_Sv (xr.Dataset): Sv dataset supplying the target ``ping_time``.
+        evl_path (str | Path): Path to the ``.evl`` file. May be a remote fsspec
+            URL (``gs://...``), which is read in place — these files are small,
+            so no local copy is made.
+        vertical_reference (str): What the EVL depths are measured from.
+            ``"surface"`` (default) is Echoview's usual seabed-line reference,
+            metres below the water surface; ``"transducer"`` is metres along the
+            beam from the transducer face. The line is converted to whichever
+            reference ``ds_Sv`` carries — ``depth`` when ``add_depth`` has been
+            run upstream, otherwise ``echo_range``.
+        min_status (int | None): Drop line points whose Echoview status is below
+            this (0 none, 1 unverified, 2 bad, 3 good). ``None`` (default) keeps
+            every point. Dropped points leave a gap, subject to ``max_gap_s``.
+        max_gap_s (float | None): Widest hole in the line, in seconds, to
+            interpolate across; pings inside a wider hole are NaN. A ping that
+            lands exactly on a line point always keeps that point's depth.
+            ``None`` (default) interpolates across holes of any width.
+        edge_extend_s (float | None): How many seconds past the line's first and
+            last point to hold that point's depth. Default ``0.0`` — no
+            extrapolation, so pings outside the line's span are NaN. ``None``
+            holds the end depths indefinitely.
+        depth_offset_m (float): Constant metres added to the line, for when the
+            transducer draft configured in Echoview differs from the one baked
+            into ``ds_Sv['depth']``. Positive pushes the seafloor deeper.
+        min_coverage (float): Fraction of pings (0-1) that must end up with a
+            finite depth; below it a ValueError is raised. Default 0.0 never
+            raises.
+
+    Returns:
+        xr.DataArray: Seafloor depth in metres, dims ``("ping_time",)``, named
+        ``seafloor_depth``, on ``ds_Sv``'s ``ping_time``.
+    """
+    points = _parse_evl(evl_path)
+
+    if min_status is not None:
+        points = points[points["status"] >= min_status]
+
+    points = (
+        points.dropna(subset=["time"])
+        .sort_values("time")
+        .drop_duplicates(subset="time", keep="first")
+    )
+    if points.empty:
+        detail = "" if min_status is None else f" with status >= {min_status}"
+        raise ValueError(f"EVL file has no line points{detail}: {evl_path}")
+
+    values = _interp_line_to_ping_time(
+        points, ds_Sv["ping_time"], max_gap_s, edge_extend_s
+    )
+
+    # Both sides of the create_seafloor_mask comparison must use the same
+    # vertical reference, so convert the line to whichever one ds_Sv provides.
+    range_var = "depth" if "depth" in ds_Sv else "echo_range"
+    if vertical_reference == "surface":
+        if range_var != "depth":
+            raise ValueError(
+                "A surface-referenced seafloor line has nothing to compare "
+                "against: ds_Sv has no 'depth' variable. Run add_depth (recipe "
+                "op 'ep_add_depth') upstream, or pass "
+                "vertical_reference='transducer' if the EVL depths are measured "
+                "from the transducer face."
+            )
+    elif vertical_reference == "transducer":
+        if range_var == "depth":
+            values = values + _computed_values(get_transducer_depth(ds_Sv))
+    else:
+        raise ValueError(
+            "vertical_reference must be 'surface' or 'transducer', got "
+            f"{vertical_reference!r}"
+        )
+
+    values = values + depth_offset_m
+
+    coverage = _log_seafloor_line_summary(
+        points, ds_Sv["ping_time"], values, evl_path
+    )
+    if coverage < min_coverage:
+        raise ValueError(
+            f"Seafloor line covers {coverage:.1%} of pings, below the required "
+            f"min_coverage of {min_coverage:.1%}: {evl_path}"
+        )
+
+    return xr.DataArray(
+        values,
+        coords={"ping_time": ds_Sv["ping_time"]},
+        dims=["ping_time"],
+        name="seafloor_depth",
+        attrs={
+            "long_name": "Seafloor depth from Echoview line file",
+            "units": "m",
+            "source_file": _storage.basename(evl_path),
+            "vertical_reference": (
+                "surface" if range_var == "depth" else "transducer"
+            ),
+            "range_var": range_var,
+            "ping_coverage": float(coverage),
+        },
+    )
 
 
 def create_seafloor_mask(ds_Sv, seafloor_depth, seafloor_buffer_m=0.0, range_var=None):
@@ -866,24 +1336,6 @@ def apply_mask_to_sv(ds_Sv, mask, fill_value=np.nan):
     Returns:
         xr.Dataset: Masked copy of *ds_Sv*.
     """
-        # Eagerly load coordinate variables that masks depend on
-    coords_to_load = ['echo_range', 'depth']
-    for coord in coords_to_load:
-        if coord in ds_Sv and hasattr(ds_Sv[coord], 'chunks') and ds_Sv[coord].chunks is not None:
-            print(f"Loading {coord} coordinate...", flush=True)
-            ds_Sv[coord] = ds_Sv[coord].compute()
-            
-        # Force computation of the Sv variable specifically (not just the dataset)
-    if hasattr(mask, 'compute'):
-        print("Computing mask...", flush=True)
-        mask = mask.compute()
-    
-    if 'Sv' in ds_Sv and hasattr(ds_Sv['Sv'], 'chunks') and ds_Sv['Sv'].chunks is not None:
-        print(f"Sv is lazy (shape: {ds_Sv['Sv'].shape}, chunks: {ds_Sv['Sv'].chunks})", flush=True)
-        print("Computing Sv variable...", flush=True)
-        ds_Sv['Sv'] = ds_Sv['Sv'].compute()
-        print("Sv computed.", flush=True)
-
     ed_masked = ep.mask.apply_mask(
         source_ds=ds_Sv,
         mask=mask,
@@ -999,9 +1451,10 @@ def initial_setup_and_validation(raw_input_folder, calibration_outputs_string="c
             on each raw file's recording span. The span is inferred from the
             ``D{YYYYMMDD}-T{HHMMSS}`` name stamps: a file's own stamp is its
             start and the next file's stamp is its end, so a file that starts
-            before this bound but records into the window is kept. Filtering
-            is name-based, so remote files are never opened or downloaded to
-            apply it.
+            before this bound but records into the window is kept. Filtering is
+            name-based except for the single file straddling this bound, whose
+            real end is read from its datagram headers so a gap between survey
+            legs is not mistaken for one long recording.
         file_time_end: Optional inclusive upper bound; see *file_time_start*.
 
     Returns:
@@ -1048,7 +1501,10 @@ def initial_setup_and_validation(raw_input_folder, calibration_outputs_string="c
     if file_time_start is not None or file_time_end is not None:
         before = len(raw_file_paths)
         raw_file_paths = filter_paths_by_file_time(
-            raw_file_paths, file_time_start, file_time_end
+            raw_file_paths,
+            file_time_start,
+            file_time_end,
+            storage_options=_execution_storage_options(),
         )
         print(
             f"  Filename-time filter: {before} -> {len(raw_file_paths)} raw file(s) "
@@ -1365,6 +1821,11 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
     ):
         remote_options = _storage.storage_options_of(_execution_temp_dir())
 
+    # Phase timing: combine_raw was observed spending minutes here while the
+    # downstream checkpoint upload of the finished store is only seconds, so the
+    # cost is in this function. These prints break the wall clock into open /
+    # combine / rechunk so a run log shows which phase dominates.
+    _t0 = time.perf_counter()
     echodata_list = []
     for item in raw_stores:
         if isinstance(item, (str, Path)):
@@ -1379,12 +1840,51 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
         else:
             # Already an in-memory EchoData object (none mode)
             echodata_list.append(item)
+    print(f"[combine_raw] opened {len(echodata_list)} store(s) in "
+          f"{time.perf_counter() - _t0:.1f}s")
 
+    _t0 = time.perf_counter()
     if len(echodata_list) == 1:
         echodata = echodata_list[0]
     else:
         echodata = ep.combine_echodata(echodata_list)
         print(f"Combined {len(echodata_list)} stores into one EchoData object")
+    print(f"[combine_raw] combine_echodata in {time.perf_counter() - _t0:.1f}s")
+
+    # EK80 only: combining N files stacks N filter-coefficient sets onto
+    # Vendor_specific.filter_time, which forces echopype's compute_Sv into its
+    # per-(channel, filter_time) loop.  That loop slices the beam to one channel
+    # at a time and then rejects user-supplied per-channel cal/env params whose
+    # length no longer matches the 1-channel slice (echopype param2da raises
+    # "lengths of 'p_val' and 'channel' should be identical").  The
+    # WBT_coeffs/PC_coeffs indexed by filter_time are used ONLY for broadband
+    # (complex_FM) pulse-compression calibration, so when the combined data has
+    # no FM beam group they are dead weight and we can safely collapse to a
+    # single filter_time -- restoring echopype's single-pass (all-channels)
+    # branch that works with per-channel cal/env lists.  Broadband data is
+    # detected via Sonar/waveform_encode_descr and left completely untouched, so
+    # FM pipelines keep every filter_time/coefficient set they need.
+    if getattr(echodata, "sonar_model", None) in ("EK80", "ES80", "EA640"):
+        _vend = echodata["Vendor_specific"]
+        if "filter_time" in _vend.dims and _vend.sizes["filter_time"] > 1:
+            _sonar = echodata["Sonar"]
+            _descr = (
+                _sonar["waveform_encode_descr"].values
+                if "waveform_encode_descr" in _sonar
+                else []
+            )
+            _has_fm = "complex_FM" in np.asarray(_descr).ravel().tolist()
+            if not _has_fm:
+                _n = _vend.sizes["filter_time"]
+                # list index keeps filter_time as a size-1 dim so echopype's
+                # `len(...) == 1` single-pass gate trips
+                echodata["Vendor_specific"] = _vend.isel(filter_time=[0])
+                print(
+                    "[combine_raw] no FM beam group; collapsed Vendor_specific "
+                    f"filter_time {_n} -> 1 (WBT/PC coeffs unused in CW)"
+                )
+
+    _t0 = time.perf_counter()
 
     # After combine_echodata the per-file dask chunks are simply concatenated,
     # producing uneven chunks along ``ping_time`` whenever files have different
@@ -1421,8 +1921,11 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
             ):
                 ds[v].encoding.pop(key, None)
         echodata[group_path] = ds
+    print(f"[combine_raw] rechunk in {time.perf_counter() - _t0:.1f}s")
 
+    _t0 = time.perf_counter()
     check_for_seafloor_depth_data(echodata)
+    print(f"[combine_raw] seafloor check in {time.perf_counter() - _t0:.1f}s")
     print("EchoData ready for processing")
     return echodata
 
@@ -1500,6 +2003,60 @@ def check_for_seafloor_depth_data(ed):
         # raise ValueError("Error: No seafloor depth data found in the raw file. Sv effects not valid!")
 
 
+#: Variables recording which source files a dataset came from. Under
+#: ``data_vars="minimal"`` these would be taken from the first segment alone,
+#: understating the provenance of a merged survey, so they are concatenated
+#: along their own dimension instead.
+_PROVENANCE_CONCAT_VARS = ("source_filenames",)
+
+
+def _restore_provenance_vars(merged, items, dim):
+    """Re-merge provenance variables so every segment's sources are listed.
+
+    Args:
+        merged: Dataset produced by the ``data_vars="minimal"`` concat.
+        items: The source segments, in order.
+        dim: The dimension the segments were concatenated along.
+
+    Returns:
+        ``merged`` with each provenance variable replaced by the
+        concatenation of that variable across all segments. Variables that
+        are absent, scalar, or already carry ``dim`` are left untouched.
+    """
+    for name in _PROVENANCE_CONCAT_VARS:
+        present = [ds for ds in items if name in ds.variables]
+        if len(present) < 2:
+            continue
+        var_dims = present[0][name].dims
+        # A scalar has no dimension to grow, and one already spanning the
+        # concat dim was handled by xr.concat itself.
+        if not var_dims or dim in var_dims:
+            continue
+        var_dim = var_dims[0]
+        # Concatenate the raw values rather than the DataArrays. The
+        # provenance dimension usually carries its own index coordinate that
+        # restarts at 0 in every segment (echopype writes filenames=[0] per
+        # file), so an xr.concat would build a duplicate-valued index and the
+        # assignment back into `merged` would fail to align. A fresh
+        # positional index over the combined length is the honest result.
+        values = np.concatenate(
+            [np.atleast_1d(np.asarray(ds[name].values)) for ds in present]
+        )
+        combined = xr.DataArray(values, dims=(var_dim,))
+        was_coord = name in merged.coords
+        # Drop the stale index coordinate too, or the assign realigns the
+        # new length-N variable against the old length-1 index.
+        merged = merged.drop_vars([name, var_dim], errors="ignore")
+        merged = (
+            merged.assign_coords({name: combined})
+            if was_coord
+            else merged.assign({name: combined})
+        )
+        if var_dim in present[0].indexes:
+            merged = merged.assign_coords({var_dim: np.arange(values.size)})
+    return merged
+
+
 def concat_datasets(datasets, dim="ping_time", **kwargs):
     """Concatenate a list of xarray Datasets along a dimension.
 
@@ -1511,10 +2068,33 @@ def concat_datasets(datasets, dim="ping_time", **kwargs):
     A single Dataset (not a list) is returned unchanged so a ``map_over``
     source that resolves to one item still works (single-item transparency).
 
+    Only variables that already have ``dim`` are concatenated. Variables
+    without it (e.g. an Sv dataset's ``frequency_nominal`` on ``(channel,)``,
+    or a scalar ``sound_speed``) are taken from the first segment and keep
+    their original shape. ``xarray.concat``'s default (``data_vars="all"``)
+    would instead broadcast every variable along ``dim``, turning
+    ``frequency_nominal`` into ``(ping_time, channel)`` and scalars into
+    ``(ping_time,)`` -- which silently corrupts the schema for downstream
+    consumers that expect per-channel metadata to stay 1-D.
+
+    Note that per-segment metadata differences are therefore resolved in
+    favour of the first segment: if segments were calibrated with different
+    environmental parameters, the merged dataset records the first segment's
+    ``sound_speed``/``sound_absorption``. The data variables themselves are
+    unaffected -- each segment's values were already computed with its own
+    parameters.
+
+    The provenance variables in :data:`_PROVENANCE_CONCAT_VARS` are exempt
+    from that rule: taking only the first segment's ``source_filenames``
+    would make a survey merged from many raw files claim a single source, so
+    they are concatenated along their own dimension to list every
+    contributing file.
+
     Args:
         datasets: A list of ``xarray.Dataset`` objects, or a single Dataset.
         dim: Dimension to concatenate along. Defaults to ``"ping_time"``.
-        **kwargs: Forwarded to :func:`xarray.concat`.
+        **kwargs: Forwarded to :func:`xarray.concat`, and override the
+            defaults set here.
 
     Returns:
         A single concatenated ``xarray.Dataset``.
@@ -1529,5 +2109,12 @@ def concat_datasets(datasets, dim="ping_time", **kwargs):
         raise ValueError("concat_datasets received no datasets to merge")
     if len(items) == 1:
         return items[0]
-    return xr.concat(items, dim=dim, **kwargs)
+    concat_kwargs = {
+        "data_vars": "minimal",
+        "coords": "minimal",
+        "compat": "override",
+        **kwargs,
+    }
+    merged = xr.concat(items, dim=dim, **concat_kwargs)
+    return _restore_provenance_vars(merged, items, dim)
 

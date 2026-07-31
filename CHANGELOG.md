@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Filename-time filtering pulled in a stale raw file from before a gap between
+  survey legs. Inferring a file's end from the next file's start stamp assumes
+  recording ran continuously, so the last file before a gap looked like it
+  recorded for the whole gap and was kept as if it straddled the window start.
+  `filter_paths_by_file_time` now reads the real last ping from the one file
+  whose verdict depends on that inference, via the new `raw_file_times` module.
+  This also settles the chronologically last file, whose end the names cannot
+  bound at all, so a long final file recording into the window is no longer
+  dropped. At most one file per call is opened and only its datagram headers
+  are read; pass `verify_boundary=False` to keep the filter name-only.
+  `query_ncei_data` is unaffected: it filters catalog metadata before anything
+  is downloaded, so `initial_setup_and_validation` applies the check afterward,
+  once the files are local.
 - Filename-time filtering (`file_time_start` / `file_time_end`) missed raw
   files that start before the window but record into it, because only each
   file's own name stamp (its recording *start*) was compared against the
@@ -27,6 +40,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback for EchoData stand-ins that lack a datatree.
 
 ### Added
+- `read_seafloor_line_evl`: reads an Echoview `.evl` seabed line and returns it
+  as a 1-D `(ping_time,)` DataArray in metres on `ds_Sv`'s exact `ping_time`
+  coordinate — a drop-in replacement for `detect_seafloor` that feeds
+  `create_seafloor_mask` unchanged, for when a hand-verified Echoview line beats
+  running detection. Local paths and remote (`gs://`) URLs are both supported;
+  line files are small, so a remote one is read in place with no local copy.
+  - Alignment is linear in time, with two independent limits. `max_gap_s` caps
+    the widest hole in the line that will be interpolated across (a ping landing
+    exactly on a line point always keeps that point's depth); `edge_extend_s`
+    caps how far past the line's first/last point its depth is held, and
+    **defaults to `0.0`** — no extrapolation, so pings outside the line's span
+    are NaN rather than silently inheriting a constant seafloor. Pass `None` to
+    either for "no limit".
+  - Because `create_seafloor_mask` rejects *every* sample of a ping whose
+    seafloor is NaN, ping coverage is printed on every call and `min_coverage`
+    turns a shortfall into an error.
+  - `vertical_reference` converts a surface- or transducer-referenced line to
+    whichever reference `ds_Sv` carries (`depth` after `add_depth`, else
+    `echo_range`); `depth_offset_m` absorbs an Echoview transducer draft that
+    differs from the one baked into `ds_Sv['depth']`.
+  - The `.evl` parser is local (no new dependency). echoregions was evaluated
+    first and rejected on two counts: its released 0.2.3 pins `zarr<3` and
+    `scipy<1.15.2`, which conflicts with `echopype>=0.11` (`zarr>=3`), and its
+    `parse_evl` fails outright under pandas 3.x by assigning datetimes into a
+    string column — on `main` as well as in the release. `_parse_evl` is kept
+    as a seam so parsing can be delegated upstream if a compatible release lands.
 - Optional Google Cloud Storage backing for `exe_temp` intermediate stores:
   when the recipe executor's scratch dir is a `gs://` URL, `read_raw_files_to_stores`
   writes per-file zarr stores to the bucket and `combine_raw_stores` reads them

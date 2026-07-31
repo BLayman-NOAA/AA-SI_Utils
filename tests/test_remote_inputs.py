@@ -57,6 +57,11 @@ def _seed_raw(fs, folder, names):
 
 # ---------------------------------------------------------------------------
 # filter_paths_by_file_time
+#
+# These cover the name-based semantics on paths that do not exist on disk, so
+# they pass verify_boundary=False wherever a file starts before the window.
+# The byte-accurate boundary check has its own file-backed tests in
+# test_raw_file_times.py.
 # ---------------------------------------------------------------------------
 
 _RAW_A = "D20160725-T205832.raw"   # 2016-07-25 20:58:32
@@ -86,7 +91,9 @@ def test_filter_inclusive_bounds():
 def test_filter_accepts_datetime_bounds():
     paths = [_RAW_A, _RAW_B, _RAW_C]
     # A starts before 21:00 but records until B begins (21:05) — overlap keeps it.
-    kept = filter_paths_by_file_time(paths, datetime(2016, 7, 25, 21, 0), None)
+    kept = filter_paths_by_file_time(
+        paths, datetime(2016, 7, 25, 21, 0), None, verify_boundary=False
+    )
     assert kept == [_RAW_A, _RAW_B, _RAW_C]
 
 
@@ -94,7 +101,9 @@ def test_filter_includes_file_straddling_window_start():
     paths = [_RAW_A, _RAW_B, _RAW_C]
     # A (20:58:32) starts before the window but records until B starts
     # (21:05:00), so it has in-window data and is kept.
-    kept = filter_paths_by_file_time(paths, "2016-07-25T21:00", "2016-07-25T21:30:00")
+    kept = filter_paths_by_file_time(
+        paths, "2016-07-25T21:00", "2016-07-25T21:30:00", verify_boundary=False
+    )
     assert kept == [_RAW_A, _RAW_B, _RAW_C]
 
 
@@ -102,14 +111,18 @@ def test_filter_excludes_file_ending_exactly_at_window_start():
     paths = [_RAW_A, _RAW_B, _RAW_C]
     # A's recording ends the instant B starts (21:05:00) — exactly at the
     # window start — so A has no in-window data.
-    kept = filter_paths_by_file_time(paths, "2016-07-25T21:05:00", None)
+    kept = filter_paths_by_file_time(
+        paths, "2016-07-25T21:05:00", None, verify_boundary=False
+    )
     assert kept == [_RAW_B, _RAW_C]
 
 
 def test_filter_last_file_falls_back_to_own_stamp():
     # The chronologically last file has no next stamp to bound its end, so
     # only its own stamp decides: A alone, before the window, is excluded.
-    assert filter_paths_by_file_time([_RAW_A], "2016-07-25T21:00", None) == []
+    assert filter_paths_by_file_time(
+        [_RAW_A], "2016-07-25T21:00", None, verify_boundary=False
+    ) == []
 
 
 def test_filter_excludes_unparseable_names_when_bounded():
@@ -129,7 +142,9 @@ def test_filter_local_and_url_agree():
 def test_filter_ignores_dir_stamp_uses_basename():
     # A parent directory carrying a D..-T.. stamp must not affect the file's time.
     paths = [f"/D20160725-T210500/{_RAW_A}"]  # file is A (20:58:32)
-    assert filter_paths_by_file_time(paths, "2016-07-25T21:00", None) == []
+    assert filter_paths_by_file_time(
+        paths, "2016-07-25T21:00", None, verify_boundary=False
+    ) == []
 
 
 # ---------------------------------------------------------------------------

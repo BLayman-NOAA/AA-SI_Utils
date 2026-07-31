@@ -35,6 +35,7 @@ from .utils import (
     mask_frequency_channels,
     mask_sparse_bins,
     read_raw_files_to_stores,
+    read_seafloor_line_evl,
     remove_seafloor_from_mask,
     remove_surface_from_mask,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "mask_frequency_channels",
     "mask_sparse_bins",
     "query_ncei_data",
+    "read_seafloor_line_evl",
     "remove_seafloor_from_mask",
     "remove_surface_from_mask",
 ]
