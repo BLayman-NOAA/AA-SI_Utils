@@ -148,6 +148,22 @@ def test_source_filenames_lists_every_segment(as_coord):
     assert ("source_filenames" in merged.coords) is as_coord
 
 
+def test_concat_dataarrays():
+    """Per-segment DataArrays must still concatenate.
+
+    A collect fan-in over a DataArray-producing step (e.g. detect_seafloor's
+    per-file seafloor_depth) hits this path, and xr.concat rejects the
+    data_vars/coords kwargs used for Datasets.
+    """
+    segs = [
+        xr.DataArray(np.array([0.0, 1.0]), dims=("ping_time",)),
+        xr.DataArray(np.array([2.0, 3.0]), dims=("ping_time",)),
+    ]
+    merged = concat_datasets(segs, dim="ping_time")
+    assert isinstance(merged, xr.DataArray)
+    assert list(merged.values) == [0.0, 1.0, 2.0, 3.0]
+
+
 def test_segments_without_source_filenames_still_merge():
     merged = concat_datasets([_sv_seg([0, 1]), _sv_seg([2, 3])])
     assert "source_filenames" not in merged.variables

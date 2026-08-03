@@ -12,6 +12,7 @@ import math
 import os
 import shutil
 import stat
+import sys
 import time
 from pathlib import Path
 
@@ -1579,22 +1580,83 @@ def _resolve_intermediate_dir() -> tuple[Path | str, dict | None]:
     return Path(tempfile.gettempdir()) / "aa_si_utils_temp" / "data", None
 
 
+def _grant_access(path):
+    """Add the owner permissions needed to remove ``path``.
+
+    Read and write are always granted; execute is added for directories only,
+    so a data file is never made executable.  Bits are OR-ed onto the current
+    mode rather than replacing it: assigning ``stat.S_IWRITE`` outright is
+    ``0o200``, which on POSIX strips read and execute from a directory and
+    leaves it permanently unlistable -- turning a transient rmtree error into a
+    permanent "Permission denied" on that path.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    wanted = mode | stat.S_IWRITE | stat.S_IREAD
+    if stat.S_ISDIR(mode):
+        wanted |= stat.S_IEXEC
+    if wanted != mode:
+        try:
+            os.chmod(path, wanted)
+        except OSError:
+            pass
+
+
+def _rmtree_onerror(func, fpath, _exc):
+    """``shutil.rmtree`` error handler that fixes up permissions and retries.
+
+    Removing an entry needs write and execute on its *parent*; listing a
+    directory needs read and execute on the directory *itself*.  Both are
+    granted, since which one is missing depends on whether rmtree failed while
+    scanning or while unlinking.
+    """
+    _grant_access(os.path.dirname(fpath) or ".")
+    _grant_access(fpath)
+    func(fpath)
+
+
 def _remove_existing_store(path):
-    """Remove a store dir/file, clearing the Windows read-only bit if needed."""
+    """Remove a store dir/file, fixing up restrictive permissions if needed."""
     path = Path(path)
     if not path.exists():
         return
     if path.is_dir():
-        def _on_error(func, fpath, _exc_info):
-            os.chmod(fpath, stat.S_IWRITE)
-            func(fpath)
-        shutil.rmtree(path, onerror=_on_error)
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_rmtree_onerror)
+        else:
+            shutil.rmtree(path, onerror=_rmtree_onerror)
     else:
         path.unlink()
 
 
+def _is_transient_windows_lock(exc):
+    """Return True for a Windows file-lock/rename PermissionError.
+
+    A POSIX ``EACCES`` carries no ``winerror`` and is not transient: the
+    permissions will be exactly the same on the next attempt, so retrying only
+    repeats the failed removal and delays the real error.
+    """
+    return getattr(exc, "winerror", None) is not None
+
+
+def _store_write_context(store_path):
+    """Describe a failed store write: path, existing remains, free disk."""
+    parts = [f"store: {store_path}"]
+    path = Path(store_path)
+    if path.exists():
+        parts.append("a partial store is present")
+    try:
+        usage = shutil.disk_usage(path.parent if path.parent.exists() else ".")
+        parts.append(f"free disk: {usage.free / 1024 ** 3:.1f} GiB")
+    except OSError:
+        pass
+    return "; ".join(parts)
+
+
 def _write_store_with_retry(write_fn, store_path, max_retries=3, base_delay=1.0):
-    """Retry a zarr store write on transient Windows PermissionError.
+    """Write a zarr store, retrying a transient Windows PermissionError.
 
     zarr-python v3 writes each metadata file atomically: bytes go to a
     ``.partial`` temp file which is then renamed into place.  On Windows,
@@ -1603,6 +1665,9 @@ def _write_store_with_retry(write_fn, store_path, max_retries=3, base_delay=1.0)
     PermissionError [WinError 5].  Mirrors the recipe manager's checkpoint
     writer mitigation: clean up any partially-written store and retry after
     an increasing delay (1 s, 2 s).
+
+    Only that Windows race is retried.  Any other ``PermissionError`` is raised
+    on the first attempt with the store path, remains, and free disk attached.
     """
     last_exc = None
     for attempt in range(max_retries):
@@ -1612,9 +1677,72 @@ def _write_store_with_retry(write_fn, store_path, max_retries=3, base_delay=1.0)
             return
         except PermissionError as exc:
             last_exc = exc
+            if not _is_transient_windows_lock(exc):
+                raise PermissionError(
+                    f"{exc} ({_store_write_context(store_path)})"
+                ) from exc
             if attempt < max_retries - 1:
                 time.sleep(base_delay * (2 ** attempt))
     raise last_exc
+
+
+def _fmt_gib(num_bytes):
+    """Format a byte count as GiB."""
+    return f"{num_bytes / 1024 ** 3:.2f} GiB"
+
+
+def _free_disk_note(target):
+    """Free space on the filesystem holding ``target``, or '' if remote."""
+    if target is None or _storage.is_remote(target):
+        return ""
+    path = Path(os.fspath(target))
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    try:
+        return f", free disk {_fmt_gib(shutil.disk_usage(path).free)}"
+    except OSError:
+        return ""
+
+
+def _memory_note():
+    """Available RAM, plus echopype's swap threshold, or '' if unavailable."""
+    try:
+        import psutil  # noqa: PLC0415
+    except ImportError:
+        return ""
+    mem = psutil.virtual_memory()
+    return (
+        f", RAM {_fmt_gib(mem.available)} free of {_fmt_gib(mem.total)}"
+        f" (swap above {_fmt_gib(mem.total * 0.4)})"
+    )
+
+
+def _swap_note(ed):
+    """Report whether echopype backed backscatter_r with dask (swap mode).
+
+    ``use_swap`` is decided per file from live memory pressure, so it can flip
+    partway through a survey. Reading it off the object is the only way to know
+    which path a given file actually took.
+    """
+    try:
+        beam = ed["Sonar/Beam_group1"]
+        chunks = beam["backscatter_r"].chunks
+    except Exception:
+        return ""
+    return ", backscatter_r dask-backed (swap)" if chunks else ""
+
+
+def _store_size_note(store_path):
+    """On-disk size of a written store, or '' when it cannot be measured."""
+    try:
+        if _storage.is_remote(store_path):
+            return ""
+        total = sum(
+            f.stat().st_size for f in Path(store_path).rglob("*") if f.is_file()
+        )
+    except OSError:
+        return ""
+    return f", store {_fmt_gib(total)}"
 
 
 def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
@@ -1625,9 +1753,26 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
     a closure over the caller's loop variables): this is the per-file unit that
     a future ``map_over`` step will dispatch, and it must stay picklable for
     the Dask/Prefect executors.
+
+    Prints one line before parsing and one after writing. This is the record of
+    how far a conversion got when a later file fails, and of whether echopype
+    switched to swap mode partway through, so it is not gated behind a flag.
     """
+    label = Path(local_raw_path).name
+    try:
+        raw_size = f", raw {_fmt_gib(Path(local_raw_path).stat().st_size)}"
+    except OSError:
+        raw_size = ""
+    print(f"  open_raw {label}{raw_size}{_memory_note()}", flush=True)
+
+    parse_start = time.perf_counter()
     ed = ep.open_raw(local_raw_path, sonar_model=sonar_model,
                      include_bot=include_bot, use_swap=use_swap)
+    print(
+        f"  parsed {label} in {time.perf_counter() - parse_start:.1f}s"
+        f"{_swap_note(ed)}",
+        flush=True,
+    )
 
     if intermediate_format == "none":
         return ed
@@ -1637,6 +1782,11 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
         return str(store_path)
 
     store_path = _storage.join(store_dir, f"{local_raw_path.stem}.zarr")
+    print(
+        f"  writing {store_path}{_free_disk_note(store_dir)}",
+        flush=True,
+    )
+    write_start = time.perf_counter()
     # Match the checkpoint writer exactly: zarr_format=2 and compress=False.
     # Writing v3 encodes echopype's fixed-length UTF-32 string metadata
     # with a v3 serializer the v2 checkpoint write cannot express
@@ -1670,11 +1820,21 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
         finally:
             _storage._rmtree_local(scratch)
     else:
+        # overwrite=True matches the remote branch above. Without it, echopype's
+        # to_file() logs "already exists, will not overwrite" and returns
+        # WITHOUT writing whenever the store still exists, so a store this
+        # function only partly removed would be reported as a success and fail
+        # much later, in combine_raw, as a corrupt store.
         _write_store_with_retry(
             lambda: ed.to_zarr(save_path=store_path, zarr_format=2,
-                               compress=False),
+                               compress=False, overwrite=True),
             store_path,
         )
+    print(
+        f"  wrote {label} in {time.perf_counter() - write_start:.1f}s"
+        f"{_store_size_note(store_path)}{_free_disk_note(store_dir)}",
+        flush=True,
+    )
     return str(store_path)
 
 
@@ -1749,7 +1909,11 @@ def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=Tru
     companions = (".bot",) if include_bot else ()
 
     results = []
-    for raw_path in raw_file_paths:
+    total = len(raw_file_paths)
+    if store_dir is not None:
+        print(f"Intermediate stores: {store_dir}{_free_disk_note(store_dir)}")
+    for index, raw_path in enumerate(raw_file_paths, start=1):
+        print(f"[{index}/{total}] {Path(str(raw_path)).name}", flush=True)
         if _storage.is_remote(raw_path):
             with _storage.localized_file(
                 str(raw_path),
@@ -2022,7 +2186,10 @@ def _restore_provenance_vars(merged, items, dim):
         ``merged`` with each provenance variable replaced by the
         concatenation of that variable across all segments. Variables that
         are absent, scalar, or already carry ``dim`` are left untouched.
+        A non-Dataset (e.g. a concatenated DataArray) is returned unchanged.
     """
+    if not isinstance(merged, xr.Dataset):
+        return merged
     for name in _PROVENANCE_CONCAT_VARS:
         present = [ds for ds in items if name in ds.variables]
         if len(present) < 2:
@@ -2109,12 +2276,21 @@ def concat_datasets(datasets, dim="ping_time", **kwargs):
         raise ValueError("concat_datasets received no datasets to merge")
     if len(items) == 1:
         return items[0]
-    concat_kwargs = {
-        "data_vars": "minimal",
-        "coords": "minimal",
-        "compat": "override",
-        **kwargs,
-    }
+    if isinstance(items[0], xr.Dataset):
+        concat_kwargs = {
+            "data_vars": "minimal",
+            "coords": "minimal",
+            "compat": "override",
+            **kwargs,
+        }
+    else:
+        # xr.concat rejects data_vars/coords on DataArray input ("data_vars is
+        # not a valid argument when concatenating DataArray objects"). A
+        # DataArray has no non-concat-dim variables to protect anyway, so the
+        # plain concat is already the correct behaviour. Collecting per-segment
+        # DataArrays (e.g. detect_seafloor's per-file seafloor_depth) is a real
+        # fan-in shape, so it must keep working.
+        concat_kwargs = dict(kwargs)
     merged = xr.concat(items, dim=dim, **concat_kwargs)
     return _restore_provenance_vars(merged, items, dim)
 

@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `read_raw_files_to_stores` reports progress per file: `[i/n]` with the raw
+  file's name and size, available RAM against echopype's swap threshold, parse
+  time, whether `backscatter_r` came back dask-backed (echopype decided to swap
+  it to disk, a per-file decision driven by live memory pressure), the store
+  being written, its size, and free disk before and after. Not gated behind a
+  flag: this is the record of how far a conversion got, and it is only useful
+  if it is already there when a run fails.
+
 ### Fixed
+- Removing an existing intermediate store could fail permanently with
+  `[Errno 13] Permission denied` naming a directory inside it. The `rmtree`
+  error handler assigned `stat.S_IWRITE` to the failing path, which is `0o200`
+  exactly: on POSIX that strips read and execute from a directory, so the retry
+  it performs immediately afterwards fails with EACCES on that same path, and
+  the original error is lost. `_remove_existing_store` now grants read and write
+  (plus execute for directories only) by OR-ing onto the existing mode, and
+  fixes up the parent as well, since unlinking an entry needs write and execute
+  there rather than on the entry itself.
+- `_write_store_with_retry` retried any `PermissionError` three times over three
+  seconds. Only the Windows rename race it was written for is transient; a POSIX
+  EACCES will be identical on the next attempt, so retrying only delayed the
+  error and re-ran a removal that could not succeed. Non-Windows permission
+  errors now raise on the first attempt, with the store path, whether a partial
+  store is present, and free disk space attached to the message.
+- The local zarr write did not pass `overwrite=True` while the remote one did.
+  If a store was only partly removed, echopype's `to_file` logs "already exists,
+  will not overwrite" and returns **without writing**, so a truncated store was
+  reported as a successful conversion and failed later, in `combine_raw`, as a
+  corrupt store. The two branches are now symmetric.
 - Filename-time filtering pulled in a stale raw file from before a gap between
   survey legs. Inferring a file's end from the next file's start stamp assumes
   recording ran continuously, so the last file before a gap looked like it
