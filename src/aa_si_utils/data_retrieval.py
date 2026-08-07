@@ -199,6 +199,94 @@ def filter_paths_by_file_time(
     return [path for path, keep in zip(paths, kept) if keep]
 
 
+# Echoview seabed-line helpers
+
+_EVL_NAME_RE = re.compile(r"d(\d{8})_t(\d{6})-t(\d{6})")
+
+
+def parse_evl_span_from_filename(filename):
+    """Extract the time span encoded in an Echoview seabed-line file name.
+
+    Matches the ``d{YYYYMMDD}_t{HHMMSS}-t{HHMMSS}`` pattern anywhere in the
+    name, e.g. ``d20241012_t005144-t115311_evseabed.evl`` or the longer
+    ``HDD_Henry_B_Bigelow_HB2407_..._d20241012_t005144-t115311_evseabed.evl``.
+
+    The second stamp is the export's nominal end. It under-reports the line's
+    real last point by roughly one raw file's duration, so it is used only as a
+    fallback for the chronologically last file -- see
+    :func:`filter_evl_paths_by_file_time`.
+
+    Returns ``(None, None)`` when the pattern is not found.
+    """
+    match = _EVL_NAME_RE.search(filename)
+    if not match:
+        return None, None
+    date_part, start_part, end_part = match.groups()
+    start = datetime.strptime(date_part + start_part, "%Y%m%d%H%M%S")
+    end = datetime.strptime(date_part + end_part, "%Y%m%d%H%M%S")
+    # Both stamps carry the same date, so an export running past midnight has an
+    # end that reads earlier than its start.
+    if end < start:
+        end += timedelta(days=1)
+    return start, end
+
+
+def filter_evl_paths_by_file_time(paths, file_time_start=None, file_time_end=None):
+    """Filter Echoview ``.evl`` paths by the span inferred from their file names.
+
+    Works on local paths and remote URLs alike: only the final path segment is
+    inspected. Bounds are inclusive and may be ISO strings or ``datetime``
+    objects.
+
+    A line file's span runs from its own name stamp to the *next* file's stamp,
+    the same inference :func:`filter_paths_by_file_time` makes for raw files.
+    The name's own end stamp is the fallback for the chronologically last file,
+    whose end no later file can bound. That is deliberately generous: a file is
+    kept when its span overlaps the window, so the export straddling the window
+    start comes along and the leading pings keep a seafloor. Over-including a
+    line file only adds points outside the ping range, which ``edge_extend_s``
+    and ``max_gap_s`` already handle, while under-including one leaves pings
+    with a NaN seafloor that ``create_seafloor_mask`` masks away entirely.
+
+    Names without a parseable span are excluded whenever a bound is given.
+
+    Passing no bounds returns the paths unchanged.
+
+    Args:
+        paths: Iterable of path-like values or URL strings.
+        file_time_start: Optional inclusive lower bound.
+        file_time_end: Optional inclusive upper bound.
+
+    Returns:
+        list: The subset of *paths* overlapping the window, order preserved.
+    """
+    if file_time_start is None and file_time_end is None:
+        return list(paths)
+
+    start = _coerce_datetime(file_time_start)
+    end = _coerce_datetime(file_time_end)
+
+    paths = list(paths)
+    spans = [parse_evl_span_from_filename(_path_basename(p)) for p in paths]
+    next_stamps = _next_stamp_map([span_start for span_start, _ in spans])
+
+    kept = []
+    for span_start, name_end in spans:
+        if span_start is None:
+            kept.append(False)
+            continue
+        next_start = next_stamps.get(span_start)
+        # max() is defensive: for a well-formed, non-overlapping export set the
+        # next file's start is always the later of the two.
+        span_end = name_end if next_start is None else max(name_end, next_start)
+        kept.append(
+            (end is None or span_start <= end)
+            and (start is None or span_end >= start)
+        )
+
+    return [path for path, keep in zip(paths, kept) if keep]
+
+
 def _validate_string_value(value, param_name):
     """Reject values that could break the ArcGIS REST SQL WHERE clause."""
     dangerous = {"'", ";", "--", "/*", "*/"}

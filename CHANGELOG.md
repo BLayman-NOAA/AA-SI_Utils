@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `read_seafloor_line_evl` accepts a folder of Echoview exports (local or
+  `gs://`) as well as a single `.evl` file, and takes `file_time_start` /
+  `file_time_end` — the same window that selects the raw files. The line files
+  spanning that window are read and concatenated into one line before
+  interpolation, so a survey exported as part-day line files needs no manual
+  picking. A single `.evl` path is read whole regardless of the window: naming
+  one file is an override, not a candidate set. `source_file` lists every file
+  used and the printed summary names them.
+- `filter_evl_paths_by_file_time` and `parse_evl_span_from_filename` in
+  `data_retrieval`, beside the raw-file equivalents they reuse. A line file's
+  span runs from its own `d{YYYYMMDD}_t{HHMMSS}` start stamp to the **next**
+  file's, not to the end stamp in its own name — Echoview's end stamp
+  under-reports the line's real last point by about one raw file's duration, so
+  trusting it would drop the export straddling the window start and leave those
+  pings with a NaN seafloor, which `create_seafloor_mask` masks away entirely.
+  The last file, which no later file can bound, falls back to its own end stamp.
+  Selection is name-based, so no line data is read to filter.
 - `read_raw_files_to_stores` reports progress per file: `[i/n]` with the raw
   file's name and size, available RAM against echopype's swap threshold, parse
   time, whether `backscatter_r` came back dask-backed (echopype decided to swap

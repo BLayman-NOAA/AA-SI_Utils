@@ -22,7 +22,11 @@ import pandas as pd
 import xarray as xr
 
 from aa_si_utils import _storage
-from aa_si_utils.data_retrieval import filter_paths_by_file_time
+from aa_si_utils.data_retrieval import (
+    filter_evl_paths_by_file_time,
+    filter_paths_by_file_time,
+    parse_evl_span_from_filename,
+)
 
 
 # Target number of pings per chunk along ``ping_time`` when writing the combined
@@ -189,74 +193,145 @@ def mask_sparse_bins(ds_Sv: xr.Dataset,
                       range_bin: str = "2m",
                       ping_time_bin: str = "10s",
                       nan_threshold: float = 0.8,
-                      range_var: str = "echo_range") -> xr.Dataset:
+                      range_var: str = "echo_range",
+                      block_pings: int = 2000) -> xr.Dataset:
     """Mask Sv values in bins where NaN fraction meets or exceeds a threshold.
 
     Partitions the data into (time, range) bins and sets entire bins to NaN
     when the proportion of missing values within that bin is at or above
     *nan_threshold*.
 
+    Sv is counted one ping block at a time and masked through
+    :meth:`xarray.DataArray.where`, so a dask-backed input is never fully
+    materialized and the returned Sv stays lazy.  Variables other than Sv are
+    shared with the input rather than copied.
+
     Args:
         ds_Sv: Sv dataset to process.
         range_bin: Range bin size as a string (e.g. ``"2m"``).
         ping_time_bin: Time bin size as a pandas-compatible offset string
             (e.g. ``"10s"``).
-        nan_threshold: Fraction of NaN values (0–1) at or above which a bin
+        nan_threshold: Fraction of NaN values (0-1) at or above which a bin
             is masked.
         range_var: Name of the range coordinate variable.
+        block_pings: Pings read per block while counting NaNs.  Caps peak
+            memory and does not affect the result.
 
     Returns:
         xr.Dataset: Copy of *ds_Sv* with sparse bins set to NaN.
     """
-    
+    sv = ds_Sv["Sv"]
+
     # Parse range_bin and create bin edges
     range_bin_val = float(range_bin.rstrip('m'))
     range_max = float(ds_Sv[range_var].max(skipna=True).values)
     range_edges = np.arange(0, range_max + range_bin_val, range_bin_val)
-    
+    n_range_edges = len(range_edges)
+
     # Assign each point to a range bin
     range_bin_indices = np.digitize(
-        ds_Sv[range_var].isel(ping_time=0, channel=0).values, 
+        ds_Sv[range_var].isel(ping_time=0, channel=0).values,
         range_edges
-    ) - 1
-    
-    # Assign each point to a time bin
-    time_bin_map = np.zeros(len(ds_Sv['ping_time']), dtype=int)
-    for bin_idx, (_, time_group) in enumerate(ds_Sv.resample(ping_time=ping_time_bin)):
-        time_mask = np.isin(ds_Sv['ping_time'].values, time_group.indexes['ping_time'].values)
-        time_bin_map[time_mask] = bin_idx
-    
-    # Create unique bin ID for each (time_bin, range_bin) combination
-    time_grid = np.repeat(time_bin_map[:, np.newaxis], len(range_bin_indices), axis=1)
-    range_grid = np.repeat(range_bin_indices[np.newaxis, :], len(time_bin_map), axis=0)
-    combined_bin_id = time_grid * len(range_edges) + range_grid
-    
-    # Work with copy of Sv values
-    sv_values = ds_Sv["Sv"].values.copy()
-    
-    # Process each channel
-    for ch in range(sv_values.shape[0]):
-        # Flatten arrays for vectorized operations
-        sv_flat = sv_values[ch].ravel()
-        bin_id_flat = combined_bin_id.ravel()
-        
-        # Calculate NaN fraction per bin using bincount
-        is_nan = np.isnan(sv_flat).astype(int)
-        bin_counts = np.bincount(bin_id_flat)
-        nan_counts = np.bincount(bin_id_flat, weights=is_nan)
-        nan_fractions = np.divide(nan_counts, bin_counts, 
-                                 out=np.zeros_like(nan_counts, dtype=float), 
-                                 where=bin_counts > 0)
-        
-        # Mask bins exceeding threshold
+    ).astype(np.int32) - 1
+
+    # Assign each ping to a time bin.  Flooring the ping times to the bin
+    # width and factorizing gives the same bin ordinals as resampling, since
+    # both anchor fixed-frequency bins on the epoch.
+    time_bin_map = pd.DatetimeIndex(
+        ds_Sv['ping_time'].values
+    ).floor(ping_time_bin).factorize()[0].astype(np.int32)
+
+    n_pings = sv.sizes["ping_time"]
+    n_channels = sv.sizes["channel"]
+    n_bins = (int(time_bin_map.max()) + 1) * n_range_edges
+
+    def block_bin_id(lo, hi):
+        """Unique bin ID for each (time_bin, range_bin) pair in a ping block."""
+        return (time_bin_map[lo:hi, np.newaxis] * n_range_edges
+                + range_bin_indices[np.newaxis, :]).ravel()
+
+    # Count samples and NaNs per bin, reading one ping block at a time
+    bin_counts = np.zeros(n_bins, dtype=np.int64)
+    nan_counts = np.zeros((n_channels, n_bins), dtype=np.int64)
+    for lo in range(0, n_pings, block_pings):
+        hi = min(lo + block_pings, n_pings)
+        bin_id = block_bin_id(lo, hi)
+        bin_counts += np.bincount(bin_id, minlength=n_bins)
+        block = sv.isel(ping_time=slice(lo, hi)).values
+        for ch in range(n_channels):
+            nan_counts[ch] += np.bincount(
+                bin_id[np.isnan(block[ch]).ravel()], minlength=n_bins
+            )
+        del block, bin_id
+
+    # Build the keep mask from the counts alone; Sv is not read again
+    keep = np.empty(sv.shape, dtype=bool)
+    for ch in range(n_channels):
+        nan_fractions = np.divide(nan_counts[ch], bin_counts,
+                                  out=np.zeros(n_bins, dtype=float),
+                                  where=bin_counts > 0)
         bins_to_mask = nan_fractions >= nan_threshold
-        mask = bins_to_mask[bin_id_flat].reshape(sv_values[ch].shape)
-        sv_values[ch][mask] = np.nan
-    
-    # Return modified dataset
-    ds_result = ds_Sv.copy(deep=True)
-    ds_result["Sv"].values = sv_values
-    return ds_result
+        for lo in range(0, n_pings, block_pings):
+            hi = min(lo + block_pings, n_pings)
+            keep[ch, lo:hi] = ~bins_to_mask[block_bin_id(lo, hi)].reshape(hi - lo, -1)
+
+    keep_mask = xr.DataArray(keep, dims=sv.dims, coords=sv.coords)
+    return ds_Sv.assign(Sv=sv.where(keep_mask))
+
+
+def select_ping_time_range(ds_Sv: xr.Dataset,
+                           start: str | None = None,
+                           end: str | None = None) -> xr.Dataset:
+    """Narrow a Dataset to a ping_time window.
+
+    The user-facing entry point into a survey-wide Sv store.  A survey-level
+    recipe computes and checkpoints Sv once for the whole cruise; a user
+    recipe reuses that checkpoint and calls this to work on its own segment.
+
+    Cheap on a zarr-backed Dataset: ``sel`` narrows the dask graph to the
+    chunks the window touches, so only those are read.  Keep the window step
+    downstream of every step whose checkpoint you want to share -- step hashes
+    are a Merkle chain, so a window wired into an upstream step's params
+    changes that step's hash and every hash below it, and no two windows would
+    ever share a cached Sv.
+
+    Args:
+        ds_Sv: Dataset carrying a ``ping_time`` coordinate.
+        start: Inclusive ISO datetime lower bound (e.g. "2024-10-15T13:38").
+            None leaves the start open.
+        end: Inclusive ISO datetime upper bound.  None leaves the end open.
+
+    Returns:
+        xr.Dataset: The ``ping_time`` slice of *ds_Sv*.  Returned lazily when
+        the input is dask-backed.
+
+    Raises:
+        ValueError: If the window selects no pings, or if *start* is after
+            *end*.
+    """
+    if start is None and end is None:
+        return ds_Sv
+    if start is not None and end is not None:
+        if pd.Timestamp(start) > pd.Timestamp(end):
+            raise ValueError(
+                f"start {start!r} is after end {end!r}; the window is empty"
+            )
+
+    n_before = ds_Sv.sizes.get("ping_time", 0)
+    windowed = ds_Sv.sel(ping_time=slice(start, end))
+    n_after = windowed.sizes.get("ping_time", 0)
+    if n_after == 0:
+        available = ds_Sv["ping_time"].values
+        raise ValueError(
+            f"ping_time window {start!r} to {end!r} selects no pings; the "
+            f"dataset spans {available[0]} to {available[-1]}"
+        )
+    print(
+        f"select_ping_time_range: {n_before} -> {n_after} pings "
+        f"({100 * n_after / n_before:.1f}%), "
+        f"{windowed['ping_time'].values[0]} to {windowed['ping_time'].values[-1]}"
+    )
+    return windowed
 
 
 def rechunk_dataset(ds_Sv: xr.Dataset, ping_time_chunk: int) -> xr.Dataset:
@@ -275,6 +350,169 @@ def rechunk_dataset(ds_Sv: xr.Dataset, ping_time_chunk: int) -> xr.Dataset:
         xr.Dataset: *ds_Sv* rechunked along ping_time.
     """
     return ds_Sv.chunk({"ping_time": ping_time_chunk})
+
+
+def _deepest_finite_sample_per_ping(ds_Sv: xr.Dataset,
+                                    data_var: str) -> tuple[np.ndarray, np.ndarray]:
+    """Deepest range-sample index holding finite *data_var*, per ping.
+
+    Returns ``(deepest, has_any)``.  ``deepest`` is 0 for a ping with no
+    finite sample at all, which ``has_any`` distinguishes from a ping whose
+    only finite sample really is index 0.  Both reductions stay lazy on a
+    dask-backed input, so only the per-ping results are materialized.
+    """
+    finite = np.isfinite(ds_Sv[data_var])
+    extra = [d for d in finite.dims if d not in ("ping_time", "range_sample")]
+    if extra:
+        finite = finite.any(dim=extra)
+    index = xr.DataArray(
+        np.arange(ds_Sv.sizes["range_sample"]), dims="range_sample"
+    )
+    deepest = (finite * index).max(dim="range_sample")
+    has_any = finite.any(dim="range_sample")
+    return np.asarray(deepest.values), np.asarray(has_any.values)
+
+
+def crop_range_samples(ds_Sv: xr.Dataset,
+                       max_range_m: float | None = None,
+                       outlier_sigma: float | None = None,
+                       outlier_margin: float = 1.5,
+                       drop_trailing_all_nan: bool = True,
+                       data_var: str = "Sv",
+                       range_var: str = "echo_range") -> xr.Dataset:
+    """Trim trailing range samples that carry no data.
+
+    A raw file records to the sonar's configured range, so after seafloor
+    masking the deep end of ``range_sample`` is entirely NaN.  Those samples
+    still cost memory and time in every downstream step, and they widen the
+    binned cell grid that :func:`compute_per_cell_statistics` and
+    ``compute_MVBS`` build, so trimming them once is worth a step of its own.
+
+    Run this survey-wide, after the per-file datasets have been merged.  The
+    trim point is a property of the whole survey, and cropping per file would
+    leave the segments with different ``range_sample`` lengths, which the
+    ping_time concatenation resolves by padding the short ones back out with
+    NaN.
+
+    Three criteria are available and compose: whichever are active are each
+    turned into a candidate cut and the shallowest wins.
+
+    * *outlier_sigma* rejects anomalous pings, then crops to the deepest
+      **retained** ping.  A single glitch ping reaching far past the seafloor
+      otherwise holds the whole range axis open, which is what defeats
+      *drop_trailing_all_nan*.  The threshold is deliberately generous, so
+      uncommon-but-real depths survive and only wild outliers are cut.
+    * *max_range_m* is a hard ceiling, applied whether or not samples above it
+      hold data.
+    * *drop_trailing_all_nan* is the lossless fallback when no outlier test is
+      requested.
+
+    Args:
+        ds_Sv: Dataset to crop.
+        max_range_m: Hard ceiling in metres.  Range samples whose shallowest
+            *range_var* across pings exceeds this are dropped, whether or not
+            they hold data, so a ceiling below the deepest echo of interest
+            discards it.  Combines with the other criteria; None disables it.
+        outlier_sigma: Standard deviations above the mean, over the per-ping
+            deepest finite sample, at which a ping becomes a candidate
+            outlier.  None disables outlier rejection.
+        outlier_margin: Multiplier applied to ``mean + outlier_sigma * sd`` to
+            get the reject threshold.  Raise it to flag fewer pings, lower it
+            to flag more.  Only used when *outlier_sigma* is set.
+        drop_trailing_all_nan: Crop to one past the deepest range sample
+            holding a finite *data_var* value anywhere in the dataset.
+            Lossless.  Ignored when *outlier_sigma* is set.  With this False
+            and both other criteria unset the dataset is returned unchanged.
+        data_var: Variable inspected for finite values.
+        range_var: Variable supplying each sample's range in metres.
+
+    Returns:
+        xr.Dataset: *ds_Sv* sliced along ``range_sample``.
+
+    Raises:
+        ValueError: If *data_var* holds no finite values, if *max_range_m*
+            excludes every range sample, or if outlier rejection would flag
+            every ping.
+    """
+    if "range_sample" not in ds_Sv.dims:
+        return ds_Sv
+    n_before = ds_Sv.sizes["range_sample"]
+    n_keep = n_before
+    reasons: list[str] = []
+
+    if outlier_sigma is not None:
+        deepest, has_any = _deepest_finite_sample_per_ping(ds_Sv, data_var)
+        sample = deepest[has_any]
+        if sample.size == 0:
+            raise ValueError(
+                f"'{data_var}' holds no finite values; nothing to crop to"
+            )
+        threshold = outlier_margin * (sample.mean() + outlier_sigma * sample.std())
+        retained = sample <= threshold
+        n_flagged = int((~retained).sum())
+        if not retained.any():
+            raise ValueError(
+                f"outlier rejection at {outlier_margin} x (mean + "
+                f"{outlier_sigma} sd) = {threshold:.0f} flags every ping"
+            )
+        n_keep = int(sample[retained].max()) + 1
+        reasons.append(
+            f"outlier reject {outlier_margin} x (mean + {outlier_sigma} sd)"
+        )
+        print(
+            f"crop_range_samples: flagged {n_flagged} of {len(sample)} pings "
+            f"deeper than range sample {threshold:.0f} "
+            f"({outlier_margin} x (mean + {outlier_sigma} sd))"
+        )
+    elif drop_trailing_all_nan:
+        finite = np.isfinite(ds_Sv[data_var])
+        reduce_dims = [d for d in finite.dims if d != "range_sample"]
+        has_data = np.asarray(finite.any(dim=reduce_dims).values)
+        if not has_data.any():
+            raise ValueError(
+                f"'{data_var}' holds no finite values; nothing to crop to"
+            )
+        n_keep = int(np.flatnonzero(has_data)[-1]) + 1
+        reasons.append("trailing all-NaN")
+
+    if max_range_m is not None:
+        sample_range = ds_Sv[range_var]
+        reduce_dims = [d for d in sample_range.dims if d != "range_sample"]
+        shallowest = sample_range.min(dim=reduce_dims, skipna=True).values
+        within = np.flatnonzero(np.nan_to_num(shallowest, nan=np.inf) <= max_range_m)
+        if within.size == 0:
+            raise ValueError(
+                f"max_range_m={max_range_m} excludes every range sample; the "
+                f"shallowest is {np.nanmin(shallowest):.1f} m"
+            )
+        capped = int(within[-1]) + 1
+        reasons.append(f"max_range_m={max_range_m}")
+        n_keep = min(n_keep, capped)
+
+    if not reasons:
+        return ds_Sv
+    reason = " + ".join(reasons)
+
+    if n_keep >= n_before:
+        print(
+            f"crop_range_samples: keeping all {n_before} range samples "
+            f"({reason})"
+        )
+        return ds_Sv
+
+    dropped = int(
+        np.isfinite(ds_Sv[data_var].isel(range_sample=slice(n_keep, None)))
+        .sum()
+        .values
+    )
+    cropped = ds_Sv.isel(range_sample=slice(0, n_keep))
+    deepest_m = float(np.nanmax(cropped[range_var].values[..., -1]))
+    print(
+        f"crop_range_samples: {n_before} -> {n_keep} range samples "
+        f"({100 * n_keep / n_before:.1f}%), deepest kept {deepest_m:.1f} m; "
+        f"dropped {dropped} finite sample(s) ({reason})"
+    )
+    return cropped
 
 
 def generate_colors(hue_offset, num_additional_colors):
@@ -819,6 +1057,65 @@ def _parse_evl(evl_path):
     )
 
 
+def _resolve_evl_paths(evl_path, file_time_start=None, file_time_end=None):
+    """Expand a file, folder, or sequence into the ``.evl`` files to read.
+
+    A folder (local path or remote prefix) is listed for ``*.evl`` and narrowed
+    to the files whose name-encoded span overlaps the window. A single file is
+    returned as-is and never filtered -- naming one file is an override, not a
+    candidate set.
+
+    Args:
+        evl_path: Path, URL, folder, or sequence of either.
+        file_time_start: Optional inclusive lower bound (ISO string or datetime).
+        file_time_end: Optional inclusive upper bound.
+
+    Returns:
+        list: The ``.evl`` paths to parse, in chronological name order.
+    """
+    if isinstance(evl_path, (list, tuple, set)):
+        candidates = sorted(evl_path, key=str)
+        from_folder = True
+    elif _storage.is_remote(evl_path):
+        fs = _storage.get_fs(evl_path, _execution_storage_options())
+        from_folder = fs.isdir(str(evl_path))
+        if from_folder:
+            candidates = _storage.glob_url(
+                evl_path, "*.evl", _execution_storage_options()
+            )
+        else:
+            candidates = [evl_path]
+    else:
+        path = Path(evl_path)
+        from_folder = path.is_dir()
+        candidates = sorted(path.glob("*.evl")) if from_folder else [evl_path]
+
+    if not from_folder:
+        return candidates
+
+    if not candidates:
+        raise FileNotFoundError(f"No .evl line files found in folder: {evl_path}")
+
+    selected = filter_evl_paths_by_file_time(
+        candidates, file_time_start, file_time_end
+    )
+    if not selected:
+        spans = [
+            parse_evl_span_from_filename(_storage.basename(c)) for c in candidates
+        ]
+        starts = [start for start, _ in spans if start is not None]
+        ends = [end for _, end in spans if end is not None]
+        covered = (
+            f"{min(starts)} to {max(ends)}" if starts else "no parseable file names"
+        )
+        raise FileNotFoundError(
+            f"No .evl line files in {evl_path} cover "
+            f"{file_time_start} to {file_time_end}; the folder's "
+            f"{len(candidates)} files span {covered}"
+        )
+    return selected
+
+
 def _tolerance_ns(seconds):
     """Nanoseconds for a tolerance in seconds; ``None`` means "no limit"."""
     if seconds is None:
@@ -872,14 +1169,22 @@ def _interp_line_to_ping_time(points, ping_time, max_gap_s, edge_extend_s):
     return values
 
 
-def _log_seafloor_line_summary(points, ping_time, values, evl_path):
+def _log_seafloor_line_summary(points, ping_time, values, evl_paths):
     """Print line/ping alignment stats; return the covered fraction of pings."""
     n_pings = values.size
     n_filled = int(np.isfinite(values).sum())
     coverage = n_filled / n_pings if n_pings else 0.0
     ping_values = np.asarray(ping_time)
 
-    print(f"Seafloor line: {_storage.basename(evl_path)}")
+    names = [_storage.basename(path) for path in evl_paths]
+    if len(names) == 1:
+        print(f"Seafloor line: {names[0]}")
+    elif len(names) <= 5:
+        print(f"Seafloor line: {len(names)} files")
+        for name in names:
+            print(f"    {name}")
+    else:
+        print(f"Seafloor line: {len(names)} files, {names[0]} .. {names[-1]}")
     print(
         f"  Line points: {len(points)} spanning "
         f"{points['time'].iloc[0]} to {points['time'].iloc[-1]}"
@@ -914,6 +1219,8 @@ def read_seafloor_line_evl(
     edge_extend_s=0.0,
     depth_offset_m=0.0,
     min_coverage=0.0,
+    file_time_start=None,
+    file_time_end=None,
 ):
     """Read an Echoview ``.evl`` seafloor line onto ``ds_Sv``'s ping grid.
 
@@ -923,6 +1230,12 @@ def read_seafloor_line_evl(
     when a hand-verified Echoview bottom line is more trustworthy than running
     detection.
 
+    Echoview exports a survey as a series of part-day line files, so ``evl_path``
+    may be a folder: the files whose names span ``file_time_start`` to
+    ``file_time_end`` are selected and concatenated into one line before
+    interpolation. Passing the same window that selected the raw files keeps the
+    line and the pings in step.
+
     Pings the line does not cover are NaN, and :func:`create_seafloor_mask`
     rejects **every sample** of a ping whose seafloor is NaN (the metres-vs-metres
     comparison is False against NaN). Coverage is therefore printed on every
@@ -930,9 +1243,10 @@ def read_seafloor_line_evl(
 
     Args:
         ds_Sv (xr.Dataset): Sv dataset supplying the target ``ping_time``.
-        evl_path (str | Path): Path to the ``.evl`` file. May be a remote fsspec
-            URL (``gs://...``), which is read in place — these files are small,
-            so no local copy is made.
+        evl_path (str | Path | list): A single ``.evl`` file, or a folder of
+            them to select from with ``file_time_start`` / ``file_time_end``.
+            May be a remote fsspec URL (``gs://...``), which is read in place —
+            these files are small, so no local copy is made.
         vertical_reference (str): What the EVL depths are measured from.
             ``"surface"`` (default) is Echoview's usual seabed-line reference,
             metres below the water surface; ``"transducer"`` is metres along the
@@ -956,12 +1270,22 @@ def read_seafloor_line_evl(
         min_coverage (float): Fraction of pings (0-1) that must end up with a
             finite depth; below it a ValueError is raised. Default 0.0 never
             raises.
+        file_time_start (str | datetime | None): Inclusive lower bound used to
+            pick line files out of an ``evl_path`` folder, by the
+            ``d{YYYYMMDD}_t{HHMMSS}-t{HHMMSS}`` span in their names. Pass the
+            same window that selected the raw files. Ignored when ``evl_path``
+            names a single file.
+        file_time_end (str | datetime | None): Inclusive upper bound; see
+            ``file_time_start``.
 
     Returns:
         xr.DataArray: Seafloor depth in metres, dims ``("ping_time",)``, named
         ``seafloor_depth``, on ``ds_Sv``'s ``ping_time``.
     """
-    points = _parse_evl(evl_path)
+    evl_paths = _resolve_evl_paths(evl_path, file_time_start, file_time_end)
+    points = pd.concat(
+        [_parse_evl(path) for path in evl_paths], ignore_index=True
+    )
 
     if min_status is not None:
         points = points[points["status"] >= min_status]
@@ -973,7 +1297,10 @@ def read_seafloor_line_evl(
     )
     if points.empty:
         detail = "" if min_status is None else f" with status >= {min_status}"
-        raise ValueError(f"EVL file has no line points{detail}: {evl_path}")
+        raise ValueError(
+            f"EVL input has no line points{detail}: "
+            f"{', '.join(str(path) for path in evl_paths)}"
+        )
 
     values = _interp_line_to_ping_time(
         points, ds_Sv["ping_time"], max_gap_s, edge_extend_s
@@ -1003,7 +1330,7 @@ def read_seafloor_line_evl(
     values = values + depth_offset_m
 
     coverage = _log_seafloor_line_summary(
-        points, ds_Sv["ping_time"], values, evl_path
+        points, ds_Sv["ping_time"], values, evl_paths
     )
     if coverage < min_coverage:
         raise ValueError(
@@ -1019,7 +1346,10 @@ def read_seafloor_line_evl(
         attrs={
             "long_name": "Seafloor depth from Echoview line file",
             "units": "m",
-            "source_file": _storage.basename(evl_path),
+            "source_file": ", ".join(
+                _storage.basename(path) for path in evl_paths
+            ),
+            "source_file_count": len(evl_paths),
             "vertical_reference": (
                 "surface" if range_var == "depth" else "transducer"
             ),
@@ -2059,13 +2389,23 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
     # along time so remote (bucket-backed) reads stay lazy instead of pulling
     # whole variables at once.  Groups without a ``ping_time`` dimension are small
     # metadata tables and stay single-chunk.
+    #
+    # Every other dimension collapses to a single chunk.  combine_echodata aligns
+    # its inputs with ``join="outer"``, so a dimension whose length differs
+    # between files -- ``range_sample`` when the files record different numbers of
+    # samples -- comes back reindexed into ragged blocks such as
+    # (2783, 12, 4, 7), which zarr v2 rejects just like the ping_time case.  Each
+    # source store already held that dimension in one chunk, so restoring one
+    # chunk here does not grow the per-chunk footprint.
     for group_path in echodata.group_paths:
         ds = echodata[group_path]
         if ds is None:
             continue
-        if "ping_time" in ds.dims:
+        if "ping_time" in ds.sizes:
             target = min(ping_time_chunk, ds.sizes["ping_time"])
-            ds = ds.chunk({"ping_time": target})
+            chunks = {dim: -1 for dim in ds.sizes if dim != "ping_time"}
+            chunks["ping_time"] = target
+            ds = ds.chunk(chunks)
         else:
             ds = ds.chunk(-1)
         for v in ds.variables:

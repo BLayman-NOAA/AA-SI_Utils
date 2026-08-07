@@ -2,27 +2,49 @@
 # SPDX-FileCopyrightText: NOAA Fisheries
 """Unit tests for reading an Echoview .evl seafloor line onto a ping grid."""
 
+from datetime import datetime
+
 import numpy as np
 import pytest
 import xarray as xr
 
 from aa_si_utils import utils
+from aa_si_utils.data_retrieval import (
+    filter_evl_paths_by_file_time,
+    parse_evl_span_from_filename,
+)
 
 
-def _write_evl(tmp_path, points, name="line.evl", declared=None, header=None):
+def _write_evl(
+    tmp_path, points, name="line.evl", declared=None, header=None, date="20240101"
+):
     """Write an Echoview .evl file from (time_of_day, depth, status) triples.
 
-    Times are 'HHMMSSssss' strings on 2024-01-01; ``declared`` overrides the
+    Times are 'HHMMSSssss' strings on ``date``; ``declared`` overrides the
     point count in the header so truncation can be simulated.
     """
     header = header or "EVBD 3 15.1.65.0"
     count = len(points) if declared is None else declared
     lines = [header, str(count)]
-    lines += [f"20240101 {when}  {depth} {status}" for when, depth, status in points]
+    lines += [f"{date} {when}  {depth} {status}" for when, depth, status in points]
     path = tmp_path / name
     # Echoview writes a BOM.
     path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
     return path
+
+
+# The real HB2407 export set: half-day files whose name-encoded end stamp
+# under-reports the last point by about one raw file's duration, so consecutive
+# files butt up against each other at the *next* file's start stamp.
+HB2407_LINE_NAMES = [
+    "d20240924_t005406-t110610_evseabed.evl",
+    "d20240925_t001826-t112431_evseabed.evl",
+    "d20241011_t002801-t113150_evseabed.evl",
+    "d20241011_t135328-t235639_evseabed.evl",
+    "d20241012_t005144-t115311_evseabed.evl",
+    "d20241012_t124819-t235027_evseabed.evl",
+    "d20241013_t004543-t114752_evseabed.evl",
+]
 
 
 def _make_ds_sv(seconds=(0, 1, 2), with_depth=True, transducer_depth_m=5.0):
@@ -356,6 +378,189 @@ def test_min_coverage_raises_when_the_line_falls_short(tmp_path):
 
     with pytest.raises(ValueError, match="covers 33.3% of pings"):
         utils.read_seafloor_line_evl(ds_Sv, path, min_coverage=0.9)
+
+
+# ---------------------------------------------------------------------------
+# Selecting line files from a folder by the file-time window
+# ---------------------------------------------------------------------------
+
+
+def test_parse_span_from_short_and_long_names():
+    short = parse_evl_span_from_filename("d20241012_t005144-t115311_evseabed.evl")
+    long = parse_evl_span_from_filename(
+        "HDD_Henry_B_Bigelow_HB2407_Auxiliary_EV_seabedlines"
+        "_d20241012_t005144-t115311_evseabed.evl"
+    )
+
+    assert short == (
+        datetime(2024, 10, 12, 0, 51, 44),
+        datetime(2024, 10, 12, 11, 53, 11),
+    )
+    assert long == short
+
+
+def test_parse_span_returns_none_for_an_unrecognized_name():
+    assert parse_evl_span_from_filename("seabed_line_final_v2.evl") == (None, None)
+
+
+def test_parse_span_rolls_an_end_stamp_past_midnight():
+    _, end = parse_evl_span_from_filename("d20241012_t230000-t013000_evseabed.evl")
+
+    assert end == datetime(2024, 10, 13, 1, 30, 0)
+
+
+def test_filter_keeps_the_file_straddling_the_window_start():
+    kept = filter_evl_paths_by_file_time(
+        HB2407_LINE_NAMES, "2024-10-12T00:15", "2024-10-12T11:15"
+    )
+
+    # d20241011_t135328 says it ends 23:56:39 on the 11th, but it really runs to
+    # 00:51:43 on the 12th -- the next file's start stamp. Dropping it would
+    # leave pings 00:15-00:51 with no seafloor, and those mask out entirely.
+    assert kept == [
+        "d20241011_t135328-t235639_evseabed.evl",
+        "d20241012_t005144-t115311_evseabed.evl",
+    ]
+
+
+def test_filter_falls_back_to_the_name_end_for_the_last_file():
+    # Nothing follows d20241013_t004543 to bound it, so its own end stamp
+    # (11:47:52) decides. A window opening after that excludes it.
+    assert filter_evl_paths_by_file_time(
+        HB2407_LINE_NAMES, "2024-10-13T11:00", None
+    ) == ["d20241013_t004543-t114752_evseabed.evl"]
+    assert filter_evl_paths_by_file_time(HB2407_LINE_NAMES, "2024-10-13T12:00") == []
+
+
+def test_filter_without_bounds_returns_everything():
+    assert filter_evl_paths_by_file_time(HB2407_LINE_NAMES) == HB2407_LINE_NAMES
+
+
+def test_filter_excludes_unparseable_names_when_bounded():
+    names = [*HB2407_LINE_NAMES, "notes.evl"]
+
+    kept = filter_evl_paths_by_file_time(names, "2024-09-01", "2024-12-01")
+
+    assert "notes.evl" not in kept
+    # Unbounded, nothing is judged at all.
+    assert filter_evl_paths_by_file_time(names) == names
+
+
+def test_filter_matches_on_the_basename_only():
+    # A parent directory carrying its own stamp must not decide the verdict.
+    url = "gs://bucket/d20240101_t000000-t000000/d20241012_t005144-t115311.evl"
+
+    kept = filter_evl_paths_by_file_time(
+        [url], "2024-10-12T01:00", "2024-10-12T02:00"
+    )
+
+    assert kept == [url]
+
+
+def test_folder_combines_the_files_covering_the_window(tmp_path):
+    ds_Sv = _make_ds_sv(seconds=(0, 1, 2))
+    # Two contiguous line files, split mid-window: the seam sits between the
+    # first and second ping.
+    _write_evl(
+        tmp_path,
+        [("0000000000", "20.0", "3")],
+        name="d20240101_t000000-t000000_evseabed.evl",
+    )
+    _write_evl(
+        tmp_path,
+        [("0000010000", "22.0", "3"), ("0000020000", "24.0", "3")],
+        name="d20240101_t000001-t000002_evseabed.evl",
+    )
+
+    line = utils.read_seafloor_line_evl(ds_Sv, tmp_path)
+
+    np.testing.assert_allclose(line.values, [20.0, 22.0, 24.0])
+    assert line.attrs["source_file_count"] == 2
+    assert line.attrs["ping_coverage"] == 1.0
+
+
+def test_folder_window_selects_only_the_overlapping_files(tmp_path):
+    ds_Sv = _make_ds_sv(seconds=(0, 1, 2))
+    _write_evl(
+        tmp_path,
+        [("0000000000", "20.0", "3"), ("0000020000", "24.0", "3")],
+        name="d20240101_t000000-t000002_evseabed.evl",
+    )
+    # A later export that has nothing to say about 2024-01-01T00:00.
+    _write_evl(
+        tmp_path,
+        [("1200000000", "80.0", "3")],
+        name="d20240102_t120000-t130000_evseabed.evl",
+        date="20240102",
+    )
+
+    line = utils.read_seafloor_line_evl(
+        ds_Sv,
+        tmp_path,
+        file_time_start="2024-01-01T00:00",
+        file_time_end="2024-01-01T00:00:02",
+    )
+
+    assert line.attrs["source_file"] == "d20240101_t000000-t000002_evseabed.evl"
+    np.testing.assert_allclose(line.values, [20.0, 22.0, 24.0])
+
+
+def test_folder_deduplicates_timestamps_shared_between_files(tmp_path):
+    ds_Sv = _make_ds_sv(seconds=(0,))
+    _write_evl(
+        tmp_path,
+        [("0000000000", "20.0", "3")],
+        name="d20240101_t000000-t000000_evseabed.evl",
+    )
+    # A byte-level duplicate under a different name, as the HB2407 folder has.
+    _write_evl(
+        tmp_path,
+        [("0000000000", "20.0", "3")],
+        name="HDD_survey_d20240101_t000000-t000000_evseabed.evl",
+    )
+
+    line = utils.read_seafloor_line_evl(ds_Sv, tmp_path)
+
+    assert line.attrs["source_file_count"] == 2
+    np.testing.assert_allclose(line.values, [20.0])
+
+
+def test_folder_without_line_files_raises(tmp_path):
+    ds_Sv = _make_ds_sv()
+
+    with pytest.raises(FileNotFoundError, match="No .evl line files found in folder"):
+        utils.read_seafloor_line_evl(ds_Sv, tmp_path)
+
+
+def test_window_selecting_no_line_file_raises(tmp_path):
+    ds_Sv = _make_ds_sv()
+    _write_evl(
+        tmp_path,
+        [("0000000000", "20.0", "3")],
+        name="d20240101_t000000-t000002_evseabed.evl",
+    )
+
+    with pytest.raises(FileNotFoundError, match="cover 2024-06-01"):
+        utils.read_seafloor_line_evl(
+            ds_Sv, tmp_path, file_time_start="2024-06-01", file_time_end="2024-06-02"
+        )
+
+
+def test_single_file_ignores_the_window(tmp_path):
+    ds_Sv = _make_ds_sv(seconds=(0, 1, 2))
+    path = _write_evl(
+        tmp_path,
+        [("0000000000", "20.0", "3"), ("0000020000", "24.0", "3")],
+        name="d20240101_t000000-t000002_evseabed.evl",
+    )
+
+    # A window the file's name does not overlap: naming one file is an override.
+    line = utils.read_seafloor_line_evl(
+        ds_Sv, path, file_time_start="2024-06-01", file_time_end="2024-06-02"
+    )
+
+    np.testing.assert_allclose(line.values, [20.0, 22.0, 24.0])
+    assert line.attrs["source_file"] == "d20240101_t000000-t000002_evseabed.evl"
 
 
 # ---------------------------------------------------------------------------

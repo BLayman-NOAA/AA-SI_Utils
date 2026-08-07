@@ -238,6 +238,97 @@ def test_initial_setup_local_regression(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# read_seafloor_line_evl: remote folder of .evl exports
+# ---------------------------------------------------------------------------
+
+
+def _seed_evl(fs, folder, name, points, date="20240101"):
+    """Write a BOM'd .evl into the memory filesystem."""
+    lines = ["EVBD 3 15.1.65.0", str(len(points))]
+    lines += [f"{date} {when}  {depth} {status}" for when, depth, status in points]
+    fs.pipe_file(
+        f"{folder}/{name}", ("\n".join(lines) + "\n").encode("utf-8-sig")
+    )
+
+
+def _make_evl_ds_sv(seconds=(0, 1, 2)):
+    ping_time = pd.to_datetime(
+        [f"2024-01-01T00:00:{second:02d}" for second in seconds]
+    ).values
+    echo_range = xr.DataArray(
+        [[[0.0, 10.0]] * len(ping_time)],
+        dims=("channel", "ping_time", "range_sample"),
+    )
+    return xr.Dataset(
+        {"Sv": echo_range * 0, "echo_range": echo_range, "depth": echo_range + 5.0},
+        coords={
+            "channel": ["38000"],
+            "ping_time": ping_time,
+            "range_sample": [0, 1],
+        },
+    )
+
+
+def test_read_seafloor_line_remote_folder_combines_and_filters(tmp_path):
+    from aa_recipe_manager.executor.runtime_context import execution_context
+
+    fs = fsspec.filesystem("memory")
+    _seed_evl(
+        fs,
+        "/survey/seabed_lines",
+        "d20240101_t000000-t000000_evseabed.evl",
+        [("0000000000", "20.0", "3")],
+    )
+    _seed_evl(
+        fs,
+        "/survey/seabed_lines",
+        "d20240101_t000001-t000002_evseabed.evl",
+        [("0000010000", "22.0", "3"), ("0000020000", "24.0", "3")],
+    )
+    # A later export the window must exclude.
+    _seed_evl(
+        fs,
+        "/survey/seabed_lines",
+        "d20240103_t120000-t130000_evseabed.evl",
+        [("1200000000", "80.0", "3")],
+        date="20240103",
+    )
+
+    ds_Sv = _make_evl_ds_sv()
+    with execution_context(mode="direct", artifacts_dir=tmp_path):
+        line = utils.read_seafloor_line_evl(
+            ds_Sv,
+            "memory://survey/seabed_lines",
+            file_time_start="2024-01-01T00:00",
+            file_time_end="2024-01-01T00:00:02",
+        )
+
+    assert line.attrs["source_file_count"] == 2
+    assert line.attrs["ping_coverage"] == 1.0
+    assert [round(float(v), 1) for v in line.values] == [20.0, 22.0, 24.0]
+
+
+def test_read_seafloor_line_remote_single_file(tmp_path):
+    from aa_recipe_manager.executor.runtime_context import execution_context
+
+    fs = fsspec.filesystem("memory")
+    _seed_evl(
+        fs,
+        "/survey/seabed_lines",
+        "d20240101_t000000-t000002_evseabed.evl",
+        [("0000000000", "20.0", "3"), ("0000020000", "24.0", "3")],
+    )
+    url = "memory://survey/seabed_lines/d20240101_t000000-t000002_evseabed.evl"
+
+    ds_Sv = _make_evl_ds_sv()
+    with execution_context(mode="direct", artifacts_dir=tmp_path):
+        line = utils.read_seafloor_line_evl(ds_Sv, url)
+
+    assert line.attrs["source_file"] == "d20240101_t000000-t000002_evseabed.evl"
+    assert [round(float(v), 1) for v in line.values] == [20.0, 22.0, 24.0]
+
+
+# ---------------------------------------------------------------------------
 # read_raw_files_to_stores: download -> convert -> delete
 # ---------------------------------------------------------------------------
 
