@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `build_range_grid`, producing the uniformly spaced range grid that
+  `echopype.commongrid.resample_to_geometry` takes as its `target_grid`. That
+  function wants a DataArray rather than a number, which a recipe params block
+  cannot express, so building the grid as its own step lets the resampling step
+  receive it as a wired input. `spacing_m` sets the axis length and
+  `max_range_m` caps how deep it reaches. On HB1603 a 5 m grid capped at 2100 m
+  takes a ping from 15207 range samples to 421, which is what brings clustering
+  over the full survey from 23.5 million points down to 652 thousand.
 - `read_seafloor_line_evl` accepts a folder of Echoview exports (local or
   `gs://`) as well as a single `.evl` file, and takes `file_time_start` /
   `file_time_end` — the same window that selects the raw files. The line files

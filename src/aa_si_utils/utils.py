@@ -515,6 +515,63 @@ def crop_range_samples(ds_Sv: xr.Dataset,
     return cropped
 
 
+def build_range_grid(ds_Sv: xr.Dataset,
+                     spacing_m: float,
+                     max_range_m: float | None = None,
+                     range_var: str = "echo_range") -> xr.DataArray:
+    """Build a uniformly spaced range grid to resample every channel onto.
+
+    ``echopype.commongrid.resample_to_geometry`` takes its target geometry as a
+    DataArray rather than a number, so a recipe cannot express one in a params
+    block.  This produces that array, letting a step supply the grid as a wired
+    input.
+
+    Two things follow from choosing the spacing.  A multi-frequency sonar can
+    sample each channel at a different interval, so putting them all on one
+    grid is what makes sample-level arithmetic across channels valid.  And
+    since the grid sets the range axis length, coarsening it is the lever on
+    the cost of anything that scales with pings times range samples.
+
+    Args:
+        ds_Sv: Calibrated Sv dataset supplying the range extent to cover.
+        spacing_m: Distance between adjacent target samples, in metres.
+        max_range_m: Deepest range to cover. Defaults to the deepest finite
+            value in ``range_var``. Capping it below the data's own extent
+            drops the samples past it, which is worth doing when the sonar
+            recorded well past anything of interest.
+        range_var: Meter-valued variable describing the source geometry.
+
+    Returns:
+        Target ranges in metres on a ``range_sample`` dimension, named
+        ``echo_range``, ready to pass as ``target_grid``.
+
+    Raises:
+        ValueError: If spacing_m is not positive, range_var holds no finite
+            values, or max_range_m is below the first sample.
+    """
+    if spacing_m <= 0:
+        raise ValueError(f"spacing_m must be positive, got {spacing_m}")
+    if range_var not in ds_Sv:
+        raise KeyError(f"range_var '{range_var}' not found in ds_Sv")
+
+    if max_range_m is None:
+        # xarray's reduction rather than np.nanmax: it skips NaN without
+        # warning on an all-NaN array, and does not pull a dask-backed
+        # echo_range into memory just to find one number.
+        max_range_m = float(ds_Sv[range_var].max(skipna=True).values)
+        if not np.isfinite(max_range_m):
+            raise ValueError(f"'{range_var}' holds no finite values")
+    if max_range_m < 0:
+        raise ValueError(f"max_range_m must not be negative, got {max_range_m}")
+
+    ranges = np.arange(0.0, max_range_m + spacing_m, spacing_m)
+    print(
+        f"build_range_grid: {ranges.size} target samples at {spacing_m} m "
+        f"covering 0 to {ranges[-1]:.1f} m"
+    )
+    return xr.DataArray(ranges, dims=["range_sample"], name="echo_range")
+
+
 def generate_colors(hue_offset, num_additional_colors):
     """Generate a list of visually distinct hex colours using the golden ratio.
 
