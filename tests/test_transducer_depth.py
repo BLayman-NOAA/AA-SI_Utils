@@ -26,11 +26,14 @@ def _make_ds_sv(seconds=(0, 1, 2)):
     )
 
 
-def _make_platform(drop_keel_offset=7.5, heave=None, heave_seconds=(0, 2)):
+def _make_platform(
+    drop_keel_offset=7.5, heave=None, heave_seconds=(0, 2), water_level=None
+):
     """Platform group with a scalar drop keel offset and optional time2 heave.
 
     ``drop_keel_offset`` may be a scalar or a sequence (the time3-dimensioned
-    shape older converted files carry).
+    shape older converted files carry). ``water_level`` is the EK60 shape,
+    where there is no drop keel offset at all.
     """
     data_vars = {}
     coords = {}
@@ -40,6 +43,8 @@ def _make_platform(drop_keel_offset=7.5, heave=None, heave_seconds=(0, 2)):
         else:
             data_vars["drop_keel_offset"] = (("time3",), np.asarray(drop_keel_offset))
             coords["time3"] = _times(range(len(drop_keel_offset)))
+    if water_level is not None:
+        data_vars["water_level"] = ((), water_level)
     if heave is not None:
         data_vars["vertical_offset"] = (("time2",), np.asarray(heave, dtype=float))
         coords["time2"] = _times(heave_seconds)
@@ -166,23 +171,68 @@ def test_attrs_record_the_derivation():
         datum_correction_m=-1.0,
         heave_sign=-1.0,
     )
-    assert depth.attrs["drop_keel_offset"] == 7.5
+    assert depth.attrs["static_offset_m"] == 7.5
+    assert depth.attrs["static_offset_field"] == "drop_keel_offset"
     assert depth.attrs["datum_correction_m"] == -1.0
     assert depth.attrs["heave_sign"] == -1.0
     assert depth.attrs["units"] == "m"
     assert depth.attrs["interp_method"] == "linear"
 
 
-def test_absent_drop_keel_offset_raises():
+def test_no_usable_offset_raises_and_says_what_it_tried():
     platform = _make_platform(drop_keel_offset=None)
-    with pytest.raises(KeyError, match="drop_keel_offset"):
+    with pytest.raises(KeyError, match="no usable transducer depth") as excinfo:
         utils.compute_transducer_depth(_echodata(platform), _make_ds_sv())
+    assert "'drop_keel_offset' (absent)" in str(excinfo.value)
+    assert "'water_level' (absent)" in str(excinfo.value)
 
 
-def test_nan_drop_keel_offset_raises():
+def test_nan_drop_keel_offset_with_nothing_to_fall_back_on_raises():
     platform = _make_platform(drop_keel_offset=np.nan)
-    with pytest.raises(ValueError, match="NaN"):
+    with pytest.raises(KeyError, match="all NaN"):
         utils.compute_transducer_depth(_echodata(platform), _make_ds_sv())
+
+
+# ---------------------------------------------------------------------------
+# The EK60 path: water_level instead of a drop keel offset
+# ---------------------------------------------------------------------------
+
+
+def test_water_level_is_used_when_there_is_no_drop_keel_offset():
+    """EK60. echopype maps the ER60 transducer depth into water_level.
+
+    Its own use_platform_vertical_offsets computes transducer_offset_z -
+    (water_level + heave), and the ER60 leaves transducer_offset_z at zero, so
+    that path puts the transducer above the surface and every depth comes out
+    short by twice the draft. Reading water_level directly gets the sign right.
+    """
+    platform = _make_platform(drop_keel_offset=None, water_level=9.0)
+    depth = utils.compute_transducer_depth(
+        _echodata(platform), _make_ds_sv(), use_heave=False
+    )
+    np.testing.assert_allclose(depth.values, [9.0, 9.0, 9.0])
+    assert depth.attrs["static_offset_field"] == "water_level"
+    assert depth.attrs["static_offset_m"] == 9.0
+
+
+def test_a_drop_keel_offset_wins_over_water_level():
+    """EK80 files carry both, and the keel position is the real one."""
+    platform = _make_platform(drop_keel_offset=7.5, water_level=0.0)
+    depth = utils.compute_transducer_depth(
+        _echodata(platform), _make_ds_sv(), use_heave=False
+    )
+    np.testing.assert_allclose(depth.values, [7.5, 7.5, 7.5])
+    assert depth.attrs["static_offset_field"] == "drop_keel_offset"
+
+
+def test_water_level_still_takes_heave():
+    platform = _make_platform(
+        drop_keel_offset=None, water_level=9.0, heave=[0.5, -0.5]
+    )
+    depth = utils.compute_transducer_depth(
+        _echodata(platform), _make_ds_sv(), heave_sign=1.0
+    )
+    np.testing.assert_allclose(depth.values, [9.5, 9.0, 8.5])
 
 
 def test_conflicting_drop_keel_offsets_raise():

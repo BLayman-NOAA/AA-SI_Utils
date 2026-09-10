@@ -72,6 +72,16 @@ def test_multi_store_instances_are_flattened(opened):
     assert opened == ["a.zarr", "b.zarr", "c.zarr"]
 
 
+def test_phase_timing_is_debug_logging(opened, caplog, capsys):
+    caplog.set_level("DEBUG", logger="aa_si_utils.utils")
+
+    _combine(["a.zarr"])
+
+    assert "[combine_raw] opened 1 store(s)" in caplog.text
+    assert "[combine_raw] combine_echodata" in caplog.text
+    assert capsys.readouterr().out == ""
+
+
 def test_empty_input_still_rejected():
     with pytest.raises(ValueError, match="No raw stores provided"):
         utils.combine_raw_stores([])

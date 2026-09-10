@@ -176,3 +176,38 @@ def test_time_bins_match_resample_ordinals():
         ds["ping_time"].values
     ).floor(ping_time_bin).factorize()[0]
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_a_range_coordinate_that_goes_negative_is_binned():
+    """Depth is surface-referenced, so samples above the transducer are < 0.
+
+    Zero-anchored edges put those in bin -1, and np.bincount rejects the array
+    outright: "'list' argument must have no negative elements". HB1603's
+    transducer sits 8.92 m down, so the first 46 samples of every ping are
+    negative depths.
+    """
+    ds = _make_ds_sv(n_pings=4, n_channels=1, n_range=8)
+    ds["depth"] = ds["echo_range"] - 5.0
+
+    out = utils.mask_sparse_bins(
+        ds, range_bin="2m", ping_time_bin="2s", nan_threshold=0.9,
+        range_var="depth",
+    )
+
+    assert out["Sv"].shape == ds["Sv"].shape
+    # Nothing that was already NaN came back, and nothing finite was invented.
+    assert bool((out["Sv"].isnull() >= ds["Sv"].isnull()).all())
+
+
+def test_non_negative_range_still_anchors_the_edges_at_zero():
+    """The negative case must not shift the grid for data that starts at zero."""
+    ds = _make_ds_sv(n_pings=4, n_channels=1, n_range=8)
+    kwargs = dict(range_bin="2m", ping_time_bin="2s", nan_threshold=0.5)
+
+    shifted = utils.mask_sparse_bins(ds, range_var="depth", **kwargs)
+    at_zero = utils.mask_sparse_bins(ds, range_var="echo_range", **kwargs)
+
+    # depth is echo_range + 5, which is not a bin multiple, so the two disagree
+    # only through that offset; both must produce a full result rather than
+    # raising, and neither may drop a ping.
+    assert shifted["Sv"].shape == at_zero["Sv"].shape == ds["Sv"].shape

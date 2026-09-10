@@ -12,6 +12,8 @@ except PackageNotFoundError:
 
 from .utils import (
     add_dive_profile_to_dataset,
+    add_line_from_evl,
+    add_line_overlay,
     apply_mask_to_sv,
     apply_mask_to_sv_datasets,
     apply_seafloor_and_surface_masks,
@@ -35,6 +37,7 @@ from .utils import (
     mask_frequency_channels,
     mask_sparse_bins,
     read_raw_files_to_stores,
+    read_line_evl,
     read_seafloor_line_evl,
     remove_seafloor_from_mask,
     remove_surface_from_mask,
@@ -43,11 +46,14 @@ from .utils import (
 from .data_retrieval import (
     query_ncei_data,
     download_ncei_data,
+    ncei_raw_urls,
 )
 
 __all__ = [
     "__version__",
     "add_dive_profile_to_dataset",
+    "add_line_from_evl",
+    "add_line_overlay",
     "apply_mask_to_sv",
     "apply_mask_to_sv_datasets",
     "apply_seafloor_and_surface_masks",
@@ -60,6 +66,7 @@ __all__ = [
     "createSvMask",
     "detect_seafloor",
     "download_ncei_data",
+    "ncei_raw_urls",
     "find_best_seafloor_detection",
     "find_data_depth_range",
     "generate_colors",
@@ -71,6 +78,7 @@ __all__ = [
     "mask_frequency_channels",
     "mask_sparse_bins",
     "query_ncei_data",
+    "read_line_evl",
     "read_seafloor_line_evl",
     "remove_seafloor_from_mask",
     "remove_surface_from_mask",

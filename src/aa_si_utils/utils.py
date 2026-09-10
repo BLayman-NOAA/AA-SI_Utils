@@ -8,12 +8,14 @@ using the echopype library.
 """
 
 import colorsys
+import logging
 import math
 import os
 import shutil
 import stat
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import echopype as ep
@@ -27,6 +29,8 @@ from aa_si_utils.data_retrieval import (
     filter_paths_by_file_time,
     parse_evl_span_from_filename,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Target number of pings per chunk along ``ping_time`` when writing the combined
@@ -222,10 +226,17 @@ def mask_sparse_bins(ds_Sv: xr.Dataset,
     """
     sv = ds_Sv["Sv"]
 
-    # Parse range_bin and create bin edges
+    # Parse range_bin and create bin edges. The edges start at zero for data
+    # that does, and extend downward on the same lattice when the range
+    # coordinate goes negative: depth is measured from the sea surface, so the
+    # samples between the surface and a transducer mounted below it are above
+    # the datum. Without this np.digitize returns 0 for them, the -1 makes the
+    # bin index negative, and np.bincount rejects the whole array.
     range_bin_val = float(range_bin.rstrip('m'))
     range_max = float(ds_Sv[range_var].max(skipna=True).values)
-    range_edges = np.arange(0, range_max + range_bin_val, range_bin_val)
+    range_min = float(ds_Sv[range_var].min(skipna=True).values)
+    first_edge = np.floor(min(range_min, 0.0) / range_bin_val) * range_bin_val
+    range_edges = np.arange(first_edge, range_max + range_bin_val, range_bin_val)
     n_range_edges = len(range_edges)
 
     # Assign each point to a range bin
@@ -281,7 +292,8 @@ def mask_sparse_bins(ds_Sv: xr.Dataset,
 
 def select_ping_time_range(ds_Sv: xr.Dataset,
                            start: str | None = None,
-                           end: str | None = None) -> xr.Dataset:
+                           end: str | None = None,
+                           window: Mapping | None = None) -> xr.Dataset:
     """Narrow a Dataset to a ping_time window.
 
     The user-facing entry point into a survey-wide Sv store.  A survey-level
@@ -295,20 +307,55 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
     changes that step's hash and every hash below it, and no two windows would
     ever share a cached Sv.
 
+    Two ways to say the same thing.  ``start``/``end`` is the direct form.
+    ``window`` takes a mapping carrying those two keys, which is what a mapped
+    fan-out needs: ``${_item}`` is an all-or-nothing token with no attribute
+    access, so a step mapped over a list of window dicts cannot pull ``start``
+    and ``end`` out of the item as separate params and has to take the dict
+    itself.  Extra keys in the mapping are ignored, so one dict can carry
+    everything an instance needs (a label, its line files, its raw file list)
+    while this reads only the bounds.
+
     Args:
         ds_Sv: Dataset carrying a ``ping_time`` coordinate.
         start: Inclusive ISO datetime lower bound (e.g. "2024-10-15T13:38").
             None leaves the start open.
         end: Inclusive ISO datetime upper bound.  None leaves the end open.
+        window: Mapping supplying ``start`` and ``end`` instead of passing them
+            directly, plus an optional ``label`` printed to identify the
+            instance.  Mutually exclusive with *start* and *end*.
 
     Returns:
         xr.Dataset: The ``ping_time`` slice of *ds_Sv*.  Returned lazily when
         the input is dask-backed.
 
     Raises:
-        ValueError: If the window selects no pings, or if *start* is after
-            *end*.
+        TypeError: If *window* is given and is not a mapping.
+        ValueError: If *window* is combined with *start* or *end*, if it
+            carries neither bound, if the window selects no pings, or if
+            *start* is after *end*.
     """
+    if window is not None:
+        if start is not None or end is not None:
+            raise ValueError(
+                "pass either window or start/end, not both: window "
+                f"{window!r} was given alongside start={start!r} end={end!r}"
+            )
+        if not isinstance(window, Mapping):
+            raise TypeError(
+                "window must be a mapping with 'start' and 'end' keys, got "
+                f"{type(window).__name__}"
+            )
+        if "start" not in window and "end" not in window:
+            raise ValueError(
+                "window has neither a 'start' nor an 'end' key; keys present: "
+                f"{sorted(window)}"
+            )
+        label = window.get("label")
+        if label:
+            print(f"select_ping_time_range: {label}")
+        start, end = window.get("start"), window.get("end")
+
     if start is None and end is None:
         return ds_Sv
     if start is not None and end is not None:
@@ -459,7 +506,7 @@ def crop_range_samples(ds_Sv: xr.Dataset,
         reasons.append(
             f"outlier reject {outlier_margin} x (mean + {outlier_sigma} sd)"
         )
-        print(
+        logger.debug(
             f"crop_range_samples: flagged {n_flagged} of {len(sample)} pings "
             f"deeper than range sample {threshold:.0f} "
             f"({outlier_margin} x (mean + {outlier_sigma} sd))"
@@ -494,7 +541,7 @@ def crop_range_samples(ds_Sv: xr.Dataset,
     reason = " + ".join(reasons)
 
     if n_keep >= n_before:
-        print(
+        logger.debug(
             f"crop_range_samples: keeping all {n_before} range samples "
             f"({reason})"
         )
@@ -507,7 +554,7 @@ def crop_range_samples(ds_Sv: xr.Dataset,
     )
     cropped = ds_Sv.isel(range_sample=slice(0, n_keep))
     deepest_m = float(np.nanmax(cropped[range_var].values[..., -1]))
-    print(
+    logger.debug(
         f"crop_range_samples: {n_before} -> {n_keep} range samples "
         f"({100 * n_keep / n_before:.1f}%), deepest kept {deepest_m:.1f} m; "
         f"dropped {dropped} finite sample(s) ({reason})"
@@ -825,30 +872,47 @@ def _validate_boolean_mask(mask, mask_name):
         raise TypeError(f"{mask_name} must have boolean dtype")
 
 
-def _drop_keel_offset(platform):
-    """Single drop keel offset in metres from a Platform group."""
-    if "drop_keel_offset" not in platform:
-        raise KeyError(
-            "Platform group has no 'drop_keel_offset'. Only EK80-family files "
-            "record one; pass a constant depth_offset to add_depth instead."
-        )
+#: Platform fields carrying a static transducer depth below the surface, in
+#: preference order. EK80 records the keel position in its Environment
+#: datagram; EK60 has no such field, and echopype maps the ER60 per-ping
+#: transducer_depth into water_level instead (see set_groups_ek60).
+_STATIC_DEPTH_FIELDS = ("drop_keel_offset", "water_level")
 
-    values = np.atleast_1d(_computed_values(platform["drop_keel_offset"])).astype(float)
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        raise ValueError(
-            "Platform 'drop_keel_offset' is NaN, so transducer depth cannot be "
-            "derived from it. The raw file's Environment datagram carried no "
-            "DropKeelOffset."
-        )
-    if not np.allclose(finite, finite[0]):
-        raise ValueError(
-            "Platform 'drop_keel_offset' holds more than one value "
-            f"({sorted(set(finite.tolist()))} m), so no single keel position "
-            "describes this data. Combine only files recorded with the keel at "
-            "one position, or compute depth per file before combining."
-        )
-    return float(finite[0])
+
+def _static_transducer_offset(platform):
+    """Static transducer depth in metres, and the Platform field it came from.
+
+    ``water_level`` is the EK60 path. echopype's own
+    ``use_platform_vertical_offsets`` computes ``transducer_offset_z -
+    (water_level + vertical_offset)``, which is right for its convention but
+    wrong for an EK60 file: the ER60 leaves ``transducer_offset_z`` at zero and
+    the depth comes out negative, putting the transducer above the surface.
+    Reading the field directly gets the sign right.
+    """
+    rejected = []
+    for field in _STATIC_DEPTH_FIELDS:
+        if field not in platform:
+            rejected.append(f"{field!r} (absent)")
+            continue
+        values = np.atleast_1d(_computed_values(platform[field])).astype(float)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            rejected.append(f"{field!r} (all NaN)")
+            continue
+        if not np.allclose(finite, finite[0]):
+            raise ValueError(
+                f"Platform {field!r} holds more than one value "
+                f"({sorted(set(finite.tolist()))} m), so no single transducer "
+                "position describes this data. Combine only files recorded at "
+                "one position, or compute depth per file before combining."
+            )
+        return float(finite[0]), field
+
+    raise KeyError(
+        "Platform group carries no usable transducer depth: "
+        f"{', '.join(rejected)}. Pass a constant depth_offset to add_depth "
+        "instead."
+    )
 
 
 def _heave_on_ping_time(platform, ping_time, interp_method):
@@ -885,16 +949,22 @@ def compute_transducer_depth(
 ):
     """Per-ping transducer depth (m below surface) from the EK Platform group.
 
-    Built from ``drop_keel_offset`` rather than from echopype's own platform
-    vertical offsets. On a drop keel vessel the transducers ride on a
-    retractable keel and ``drop_keel_offset`` records how far it was lowered,
-    while the ``transducer_offset_z`` and ``water_level`` fields that
-    ``add_depth(use_platform_vertical_offsets=True)`` reads are often left at
-    zero. echopype carries ``drop_keel_offset`` for provenance and never reads
-    it, so pass this result to ``add_depth`` as ``depth_offset``.
+    Reads the Platform group directly rather than going through echopype's own
+    platform vertical offsets, which get the sign wrong on both EK families for
+    different reasons. Pass the result to ``add_depth`` as ``depth_offset``.
 
-    The keel position is per file and heave is per ping, giving
-    ``drop_keel_offset + datum_correction_m + heave_sign * vertical_offset``.
+    On an EK80 drop keel vessel the transducers ride on a retractable keel and
+    ``drop_keel_offset`` records how far it was lowered, while the
+    ``transducer_offset_z`` and ``water_level`` fields
+    ``add_depth(use_platform_vertical_offsets=True)`` reads are left at zero;
+    echopype carries ``drop_keel_offset`` for provenance and never reads it.
+    An EK60 file has no ``drop_keel_offset`` at all, and echopype maps the ER60
+    per-ping transducer depth into ``water_level``, which its formula then
+    subtracts: the transducer comes out above the water surface, and every
+    depth is short by twice the draft.
+
+    The static position is per file and heave is per ping, giving
+    ``static offset + datum_correction_m + heave_sign * vertical_offset``.
     Heave is interpolated onto ``ds_Sv``'s ping_time here so that add_depth
     passes the result straight through instead of resampling it again with
     nearest neighbour.
@@ -926,7 +996,7 @@ def compute_transducer_depth(
         named ``transducer_depth``.
     """
     platform = echodata["Platform"]
-    keel_offset = _drop_keel_offset(platform)
+    keel_offset, offset_field = _static_transducer_offset(platform)
     static_depth = keel_offset + datum_correction_m
     ping_time = ds_Sv["ping_time"]
 
@@ -938,7 +1008,7 @@ def compute_transducer_depth(
         depth = xr.full_like(ping_time, static_depth, dtype=float)
         heave_pings = 0
         if use_heave:
-            print(
+            logger.debug(
                 "[transducer_depth] Platform group carries no usable heave; "
                 "holding the static keel depth on every ping"
             )
@@ -952,7 +1022,8 @@ def compute_transducer_depth(
     depth.attrs = {
         "long_name": "Transducer depth below water surface",
         "units": "m",
-        "drop_keel_offset": keel_offset,
+        "static_offset_m": keel_offset,
+        "static_offset_field": offset_field,
         "datum_correction_m": float(datum_correction_m),
         "heave_sign": float(heave_sign),
         "heave_pings": heave_pings,
@@ -960,8 +1031,8 @@ def compute_transducer_depth(
     }
 
     values = _computed_values(depth)
-    print(
-        f"[transducer_depth] drop_keel_offset {keel_offset} m "
+    logger.debug(
+        f"[transducer_depth] {offset_field} {keel_offset} m "
         f"{datum_correction_m:+g} m correction, heave on "
         f"{heave_pings}/{ping_time.size} pings, "
         f"depth {np.nanmin(values):.2f} to {np.nanmax(values):.2f} m"
@@ -1226,7 +1297,8 @@ def _interp_line_to_ping_time(points, ping_time, max_gap_s, edge_extend_s):
     return values
 
 
-def _log_seafloor_line_summary(points, ping_time, values, evl_paths):
+def _log_line_summary(points, ping_time, values, evl_paths, line_name,
+                      coverage_warning=None):
     """Print line/ping alignment stats; return the covered fraction of pings."""
     n_pings = values.size
     n_filled = int(np.isfinite(values).sum())
@@ -1235,13 +1307,13 @@ def _log_seafloor_line_summary(points, ping_time, values, evl_paths):
 
     names = [_storage.basename(path) for path in evl_paths]
     if len(names) == 1:
-        print(f"Seafloor line: {names[0]}")
+        print(f"{line_name}: {names[0]}")
     elif len(names) <= 5:
-        print(f"Seafloor line: {len(names)} files")
+        print(f"{line_name}: {len(names)} files")
         for name in names:
             print(f"    {name}")
     else:
-        print(f"Seafloor line: {len(names)} files, {names[0]} .. {names[-1]}")
+        print(f"{line_name}: {len(names)} files, {names[0]} .. {names[-1]}")
     print(
         f"  Line points: {len(points)} spanning "
         f"{points['time'].iloc[0]} to {points['time'].iloc[-1]}"
@@ -1251,25 +1323,22 @@ def _log_seafloor_line_summary(points, ping_time, values, evl_paths):
             f"  Pings: {n_pings} spanning {ping_values.min()} to {ping_values.max()}"
         )
     print(
-        f"  Coverage: {n_filled}/{n_pings} pings ({coverage:.1%}) have a seafloor depth"
+        f"  Coverage: {n_filled}/{n_pings} pings ({coverage:.1%}) have a depth"
     )
     if n_filled:
         print(
             f"  Depth: min={np.nanmin(values):.1f} m, "
             f"median={np.nanmedian(values):.1f} m, max={np.nanmax(values):.1f} m"
         )
-    if coverage < 1.0:
-        print(
-            "  WARNING: create_seafloor_mask drops a ping entirely where the "
-            "seafloor is NaN (the comparison is False for every sample). Widen "
-            "edge_extend_s / max_gap_s, or use a line covering more of the survey."
-        )
+    if coverage < 1.0 and coverage_warning:
+        print(coverage_warning)
     return coverage
 
 
-def read_seafloor_line_evl(
-    ds_Sv,
+def read_line_evl(
+    ds,
     evl_path,
+    line_name="line_depth",
     vertical_reference="surface",
     min_status=None,
     max_gap_s=None,
@@ -1278,66 +1347,58 @@ def read_seafloor_line_evl(
     min_coverage=0.0,
     file_time_start=None,
     file_time_end=None,
+    long_name=None,
+    coverage_warning=None,
 ):
-    """Read an Echoview ``.evl`` seafloor line onto ``ds_Sv``'s ping grid.
+    """Read an Echoview ``.evl`` line onto the ping grid of ``ds``.
 
-    Drop-in replacement for :func:`detect_seafloor`: returns the same 1-D
-    ``(ping_time,)`` line in metres, on ``ds_Sv``'s exact ``ping_time``
-    coordinate, so :func:`create_seafloor_mask` consumes it unchanged. Use it
-    when a hand-verified Echoview bottom line is more trustworthy than running
-    detection.
+    Returns a 1-D ``(ping_time,)`` line in metres, on the exact ``ping_time``
+    coordinate of ``ds``, converted to whichever vertical reference ``ds``
+    carries. This is the shared core behind :func:`read_seafloor_line_evl` and
+    :func:`add_line_from_evl`; call it directly when the line is wanted as a
+    standalone DataArray.
 
     Echoview exports a survey as a series of part-day line files, so ``evl_path``
     may be a folder: the files whose names span ``file_time_start`` to
     ``file_time_end`` are selected and concatenated into one line before
-    interpolation. Passing the same window that selected the raw files keeps the
-    line and the pings in step.
-
-    Pings the line does not cover are NaN, and :func:`create_seafloor_mask`
-    rejects **every sample** of a ping whose seafloor is NaN (the metres-vs-metres
-    comparison is False against NaN). Coverage is therefore printed on every
-    call, and ``min_coverage`` turns a shortfall into an error.
+    interpolation.
 
     Args:
-        ds_Sv (xr.Dataset): Sv dataset supplying the target ``ping_time``.
+        ds (xr.Dataset): Dataset supplying the target ``ping_time``.
         evl_path (str | Path | list): A single ``.evl`` file, or a folder of
             them to select from with ``file_time_start`` / ``file_time_end``.
-            May be a remote fsspec URL (``gs://...``), which is read in place —
-            these files are small, so no local copy is made.
+            May be a remote fsspec URL (``gs://...``), which is read in place.
+        line_name (str): Name given to the returned DataArray.
         vertical_reference (str): What the EVL depths are measured from.
-            ``"surface"`` (default) is Echoview's usual seabed-line reference,
-            metres below the water surface; ``"transducer"`` is metres along the
-            beam from the transducer face. The line is converted to whichever
-            reference ``ds_Sv`` carries — ``depth`` when ``add_depth`` has been
-            run upstream, otherwise ``echo_range``.
+            ``"surface"`` (default) is metres below the water surface;
+            ``"transducer"`` is metres along the beam from the transducer face.
+            The line is converted to whichever reference ``ds`` carries, which is
+            ``depth`` when ``add_depth`` has been run upstream and
+            ``echo_range`` otherwise.
         min_status (int | None): Drop line points whose Echoview status is below
             this (0 none, 1 unverified, 2 bad, 3 good). ``None`` (default) keeps
             every point. Dropped points leave a gap, subject to ``max_gap_s``.
         max_gap_s (float | None): Widest hole in the line, in seconds, to
             interpolate across; pings inside a wider hole are NaN. A ping that
             lands exactly on a line point always keeps that point's depth.
-            ``None`` (default) interpolates across holes of any width.
-        edge_extend_s (float | None): How many seconds past the line's first and
-            last point to hold that point's depth. Default ``0.0`` — no
-            extrapolation, so pings outside the line's span are NaN. ``None``
-            holds the end depths indefinitely.
-        depth_offset_m (float): Constant metres added to the line, for when the
-            transducer draft configured in Echoview differs from the one baked
-            into ``ds_Sv['depth']``. Positive pushes the seafloor deeper.
+        edge_extend_s (float | None): How many seconds past the first and last
+            line point to hold that point's depth. Default ``0.0`` performs no
+            extrapolation. ``None`` holds the end depths indefinitely.
+        depth_offset_m (float): Constant metres added to the line.
         min_coverage (float): Fraction of pings (0-1) that must end up with a
-            finite depth; below it a ValueError is raised. Default 0.0 never
-            raises.
+            finite depth; below it a ValueError is raised.
         file_time_start (str | datetime | None): Inclusive lower bound used to
             pick line files out of an ``evl_path`` folder, by the
-            ``d{YYYYMMDD}_t{HHMMSS}-t{HHMMSS}`` span in their names. Pass the
-            same window that selected the raw files. Ignored when ``evl_path``
-            names a single file.
-        file_time_end (str | datetime | None): Inclusive upper bound; see
-            ``file_time_start``.
+            ``d{YYYYMMDD}_t{HHMMSS}-t{HHMMSS}`` span in their names. Ignored
+            when ``evl_path`` names a single file.
+        file_time_end (str | datetime | None): Inclusive upper bound.
+        long_name (str | None): ``long_name`` attribute for the returned line.
+        coverage_warning (str | None): Message printed when the line covers
+            fewer than every ping.
 
     Returns:
-        xr.DataArray: Seafloor depth in metres, dims ``("ping_time",)``, named
-        ``seafloor_depth``, on ``ds_Sv``'s ``ping_time``.
+        xr.DataArray: Line depth in metres, dims ``("ping_time",)``, named
+        ``line_name``, on the ``ping_time`` of ``ds``.
     """
     evl_paths = _resolve_evl_paths(evl_path, file_time_start, file_time_end)
     points = pd.concat(
@@ -1360,24 +1421,24 @@ def read_seafloor_line_evl(
         )
 
     values = _interp_line_to_ping_time(
-        points, ds_Sv["ping_time"], max_gap_s, edge_extend_s
+        points, ds["ping_time"], max_gap_s, edge_extend_s
     )
 
-    # Both sides of the create_seafloor_mask comparison must use the same
-    # vertical reference, so convert the line to whichever one ds_Sv provides.
-    range_var = "depth" if "depth" in ds_Sv else "echo_range"
+    # A line and the data it is compared against must share a vertical
+    # reference, so convert the line to whichever one ds provides.
+    range_var = "depth" if "depth" in ds else "echo_range"
     if vertical_reference == "surface":
         if range_var != "depth":
             raise ValueError(
-                "A surface-referenced seafloor line has nothing to compare "
-                "against: ds_Sv has no 'depth' variable. Run add_depth (recipe "
-                "op 'ep_add_depth') upstream, or pass "
+                "A surface-referenced line has nothing to compare against: the "
+                "dataset has no 'depth' variable. Run add_depth (recipe op "
+                "'ep_add_depth') upstream, or pass "
                 "vertical_reference='transducer' if the EVL depths are measured "
                 "from the transducer face."
             )
     elif vertical_reference == "transducer":
         if range_var == "depth":
-            values = values + _computed_values(get_transducer_depth(ds_Sv))
+            values = values + _computed_values(get_transducer_depth(ds))
     else:
         raise ValueError(
             "vertical_reference must be 'surface' or 'transducer', got "
@@ -1386,22 +1447,22 @@ def read_seafloor_line_evl(
 
     values = values + depth_offset_m
 
-    coverage = _log_seafloor_line_summary(
-        points, ds_Sv["ping_time"], values, evl_paths
+    coverage = _log_line_summary(
+        points, ds["ping_time"], values, evl_paths, line_name, coverage_warning
     )
     if coverage < min_coverage:
         raise ValueError(
-            f"Seafloor line covers {coverage:.1%} of pings, below the required "
-            f"min_coverage of {min_coverage:.1%}: {evl_path}"
+            f"Line '{line_name}' covers {coverage:.1%} of pings, below the "
+            f"required min_coverage of {min_coverage:.1%}: {evl_path}"
         )
 
     return xr.DataArray(
         values,
-        coords={"ping_time": ds_Sv["ping_time"]},
+        coords={"ping_time": ds["ping_time"]},
         dims=["ping_time"],
-        name="seafloor_depth",
+        name=line_name,
         attrs={
-            "long_name": "Seafloor depth from Echoview line file",
+            "long_name": long_name or f"{line_name} from Echoview line file",
             "units": "m",
             "source_file": ", ".join(
                 _storage.basename(path) for path in evl_paths
@@ -1414,6 +1475,355 @@ def read_seafloor_line_evl(
             "ping_coverage": float(coverage),
         },
     )
+
+
+_SEAFLOOR_COVERAGE_WARNING = (
+    "  WARNING: create_seafloor_mask drops a ping entirely where the "
+    "seafloor is NaN (the comparison is False for every sample). Widen "
+    "edge_extend_s / max_gap_s, or use a line covering more of the survey."
+)
+
+
+def read_seafloor_line_evl(
+    ds_Sv,
+    evl_path=None,
+    vertical_reference="surface",
+    min_status=None,
+    max_gap_s=None,
+    edge_extend_s=0.0,
+    depth_offset_m=0.0,
+    min_coverage=0.0,
+    file_time_start=None,
+    file_time_end=None,
+    window=None,
+    window_key="seabed_evl",
+):
+    """Read an Echoview ``.evl`` seafloor line onto the ping grid of ``ds_Sv``.
+
+    Drop-in replacement for :func:`detect_seafloor`: returns the same 1-D
+    ``(ping_time,)`` line in metres, on the exact ``ping_time`` coordinate of
+    ``ds_Sv``, so :func:`create_seafloor_mask` consumes it unchanged. Use it
+    when a hand-verified Echoview bottom line is more trustworthy than running
+    detection.
+
+    A thin wrapper over :func:`read_line_evl`, which documents every argument in
+    full. What this adds is the coverage warning: pings the line does not cover
+    are NaN, and :func:`create_seafloor_mask` rejects **every sample** of a ping
+    whose seafloor is NaN, so a short line silently empties the echogram.
+
+    Two ways to say which line. ``evl_path`` is the direct form. ``window``
+    takes a mapping and reads the path out of it, which is what a mapped
+    fan-out needs: ``${_item}`` is an all-or-nothing token with no attribute
+    access, so a step mapped over a list of window dicts cannot pull the path
+    out of the item as its own param and has to take the dict. A window also
+    supplies ``file_time_start`` / ``file_time_end`` when they are not given
+    directly, so a folder of part-day seabed exports narrows to the window
+    without repeating its bounds.
+
+    Args:
+        ds_Sv (xr.Dataset): Sv dataset supplying the target ``ping_time``.
+        evl_path (str | Path | list | None): A single ``.evl`` file, or a folder
+            of them to select from with ``file_time_start`` / ``file_time_end``.
+            Mutually exclusive with *window*; exactly one is required.
+        vertical_reference (str): ``"surface"`` (default) or ``"transducer"``.
+        min_status (int | None): Drop points below this Echoview status.
+        max_gap_s (float | None): Widest hole to interpolate across, in seconds.
+        edge_extend_s (float | None): Seconds past the ends of the line to hold
+            the end depths.
+        depth_offset_m (float): Constant metres added to the line.
+        min_coverage (float): Fraction of pings that must have a finite depth.
+        file_time_start (str | datetime | None): Window lower bound for
+            selecting line files out of a folder. Taken from *window* when a
+            window is given and this is unset.
+        file_time_end (str | datetime | None): Window upper bound. Same.
+        window (Mapping | None): Mapping carrying the line path under
+            *window_key*, plus optional ``start`` / ``end`` bounds and a
+            ``label``. Extra keys are ignored, so one dict can carry a whole
+            instance's context.
+        window_key (str): Key the line path is read from. Defaults to
+            "seabed_evl".
+
+    Returns:
+        xr.DataArray: Seafloor depth in metres, dims ``("ping_time",)``, named
+        ``seafloor_depth``, on the ``ping_time`` of ``ds_Sv``.
+
+    Raises:
+        TypeError: If *window* is given and is not a mapping.
+        ValueError: If both or neither of *evl_path* and *window* are given, or
+            if *window* carries no line path under *window_key*.
+    """
+    if (evl_path is None) == (window is None):
+        raise ValueError(
+            "pass exactly one of evl_path or window; got "
+            f"evl_path={evl_path!r} and window={window!r}"
+        )
+    if window is not None:
+        if not isinstance(window, Mapping):
+            raise TypeError(
+                f"window must be a mapping, got {type(window).__name__}"
+            )
+        evl_path = window.get(window_key)
+        if not evl_path:
+            raise ValueError(
+                f"window {window.get('label', '<unlabelled>')!r} carries no "
+                f"line path under {window_key!r}; keys present: {sorted(window)}"
+            )
+        if file_time_start is None:
+            file_time_start = window.get("start")
+        if file_time_end is None:
+            file_time_end = window.get("end")
+
+    return read_line_evl(
+        ds_Sv,
+        evl_path,
+        line_name="seafloor_depth",
+        vertical_reference=vertical_reference,
+        min_status=min_status,
+        max_gap_s=max_gap_s,
+        edge_extend_s=edge_extend_s,
+        depth_offset_m=depth_offset_m,
+        min_coverage=min_coverage,
+        file_time_start=file_time_start,
+        file_time_end=file_time_end,
+        long_name="Seafloor depth from Echoview line file",
+        coverage_warning=_SEAFLOOR_COVERAGE_WARNING,
+    )
+
+
+def add_line_from_evl(
+    ds,
+    evl_path,
+    line_name,
+    vertical_reference="surface",
+    min_status=None,
+    max_gap_s=None,
+    edge_extend_s=0.0,
+    depth_offset_m=0.0,
+    min_coverage=0.0,
+    file_time_start=None,
+    file_time_end=None,
+    long_name=None,
+):
+    """Attach an Echoview ``.evl`` line to ``ds`` as a ``(ping_time,)`` variable.
+
+    The ``.evl`` counterpart of :func:`add_dive_profile_to_dataset`, which reads
+    the same kind of line from an R-written click CSV. Sperm whale dive profiles
+    ship as a triplet of ``.evl`` files (fitted depth, upper and lower 99%
+    confidence bound), so attaching a whole profile is three calls, one per line.
+
+    Args:
+        ds (xr.Dataset): Dataset to attach the line to. Not modified in place.
+        evl_path (str | Path | list): Line file, folder, or list of files. See
+            :func:`read_line_evl`.
+        line_name (str): Name of the variable added to the dataset.
+        vertical_reference (str): ``"surface"`` (default) or ``"transducer"``.
+        min_status (int | None): Drop points below this Echoview status.
+        max_gap_s (float | None): Widest hole to interpolate across, in seconds.
+        edge_extend_s (float | None): Seconds past the ends of the line to hold
+            the end depths.
+        depth_offset_m (float): Constant metres added to the line.
+        min_coverage (float): Fraction of pings that must have a finite depth.
+        file_time_start (str | datetime | None): Window lower bound for
+            selecting line files out of a folder.
+        file_time_end (str | datetime | None): Window upper bound.
+        long_name (str | None): ``long_name`` attribute for the added variable.
+
+    Returns:
+        xr.Dataset: A copy of ``ds`` with ``line_name`` added.
+    """
+    line = read_line_evl(
+        ds,
+        evl_path,
+        line_name=line_name,
+        vertical_reference=vertical_reference,
+        min_status=min_status,
+        max_gap_s=max_gap_s,
+        edge_extend_s=edge_extend_s,
+        depth_offset_m=depth_offset_m,
+        min_coverage=min_coverage,
+        file_time_start=file_time_start,
+        file_time_end=file_time_end,
+        long_name=long_name,
+    )
+    ds_out = ds.copy()
+    ds_out[line_name] = line
+    return ds_out
+
+
+def add_line_overlay(
+    ds,
+    line_file_path=None,
+    line_name="line",
+    file_format="auto",
+    vertical_reference="surface",
+    min_status=None,
+    max_gap_s=None,
+    edge_extend_s=0.0,
+    depth_offset_m=0.0,
+    min_coverage=0.0,
+    file_time_start=None,
+    file_time_end=None,
+    long_name=None,
+    window=None,
+    window_key=None,
+):
+    """Attach a depth-versus-time line from a file to a Dataset.
+
+    One entry point over the two line formats this workflow meets. Which one a
+    file is decides itself from the extension, so a recipe names the file and
+    not the reader.
+
+    The two formats do not carry the same thing, and the difference shows in
+    what gets added:
+
+    ``.evl``
+        An Echoview line export, one line per file. Adds a single variable
+        named exactly *line_name*. This is the format seabed exports and
+        individual dive lines arrive in, so a dive profile with its two
+        confidence bounds is three files and three calls.
+
+    ``.csv``
+        The R-written click file, which carries a whole dive profile at once.
+        Adds four variables from the one file, *line_name* used as a prefix:
+        ``{line_name}_depth`` (the raw click depths), ``{line_name}_fit`` (the
+        LOESS-smoothed curve), and ``{line_name}_lower_ci`` /
+        ``{line_name}_upper_ci``.
+
+    So *line_name* is an exact name for an EVL and a prefix for a CSV. That
+    asymmetry is in the data rather than in this function: one file holds one
+    line, the other holds four.
+
+    The alignment arguments below (*vertical_reference* through
+    *file_time_end*) apply to ``.evl`` only. A CSV carries its own timestamps
+    and is joined on nearest ping within 30 seconds.
+
+    Two ways to say which file. ``line_file_path`` is the direct form.
+    ``window`` takes a mapping and reads the path out of it under
+    *window_key*, which is what a mapped fan-out needs: ``${_item}`` is an
+    all-or-nothing token with no attribute access, so a step mapped over a list
+    of window dicts cannot pull the path out of the item as its own param. A
+    window also supplies *file_time_start* / *file_time_end* when those are not
+    given directly.
+
+    A dive profile is three separate ``.evl`` exports, so attaching a whole one
+    from a window is three calls differing only in *window_key* and
+    *line_name*. The click ``.csv`` form carries all three plus the raw click
+    depths in a single file, and needs only one.
+
+    Args:
+        ds (xr.Dataset): Dataset to attach to, supplying the target
+            ``ping_time``. Not modified in place.
+        line_file_path (str | Path | list | None): Line file. For ``.evl`` this
+            may also be a folder or list to select from with *file_time_start*
+            / *file_time_end*. May be a remote fsspec URL. Mutually exclusive
+            with *window*; exactly one is required.
+        line_name (str): Variable name for an EVL, variable prefix for a CSV.
+        file_format (str): ``"auto"`` (default), ``"evl"`` or ``"csv"``.
+            ``"auto"`` reads ``.evl`` as EVL and anything else as CSV.
+        vertical_reference (str): EVL only. ``"surface"`` (default) or
+            ``"transducer"``.
+        min_status (int | None): EVL only. Drop points below this Echoview
+            status.
+        max_gap_s (float | None): EVL only. Widest hole to interpolate across.
+        edge_extend_s (float | None): EVL only. Seconds past the line's ends to
+            hold the end depths.
+        depth_offset_m (float): EVL only. Constant metres added to the line.
+        min_coverage (float): EVL only. Fraction of pings that must get a
+            finite depth.
+        file_time_start (str | datetime | None): EVL only. Window lower bound
+            for selecting line files out of a folder.
+        file_time_end (str | datetime | None): EVL only. Window upper bound.
+        long_name (str | None): EVL only. ``long_name`` attribute for the added
+            variable.
+        window (Mapping | None): Mapping carrying the line path under
+            *window_key*, plus optional ``start`` / ``end`` bounds and a
+            ``label``. Extra keys are ignored.
+        window_key (str | None): Key the line path is read from. Required when
+            *window* is given, since a window normally carries several lines
+            and there is no sensible default among them.
+
+    Returns:
+        xr.Dataset: A copy of *ds* with the line variable(s) added.
+
+    Raises:
+        TypeError: If *window* is given and is not a mapping.
+        ValueError: If both or neither of *line_file_path* and *window* are
+            given, if *window_key* is missing or absent from the window, or if
+            *file_format* is not "auto", "evl" or "csv".
+    """
+    if (line_file_path is None) == (window is None):
+        raise ValueError(
+            "pass exactly one of line_file_path or window; got "
+            f"line_file_path={line_file_path!r} and window={window!r}"
+        )
+    if window is not None:
+        if not isinstance(window, Mapping):
+            raise TypeError(
+                f"window must be a mapping, got {type(window).__name__}"
+            )
+        if not window_key:
+            raise ValueError(
+                "window_key is required when window is given: a window carries "
+                f"several lines, and these are its keys: {sorted(window)}"
+            )
+        line_file_path = window.get(window_key)
+        if not line_file_path:
+            raise ValueError(
+                f"window {window.get('label', '<unlabelled>')!r} carries no "
+                f"line path under {window_key!r}; keys present: {sorted(window)}"
+            )
+        if file_time_start is None:
+            file_time_start = window.get("start")
+        if file_time_end is None:
+            file_time_end = window.get("end")
+
+    resolved = _resolve_line_format(line_file_path, file_format)
+
+    if resolved == "evl":
+        return add_line_from_evl(
+            ds,
+            line_file_path,
+            line_name=line_name,
+            vertical_reference=vertical_reference,
+            min_status=min_status,
+            max_gap_s=max_gap_s,
+            edge_extend_s=edge_extend_s,
+            depth_offset_m=depth_offset_m,
+            min_coverage=min_coverage,
+            file_time_start=file_time_start,
+            file_time_end=file_time_end,
+            long_name=long_name,
+        )
+    return add_dive_profile_to_dataset(
+        ds, line_file_path, dive_profile_name=line_name
+    )
+
+
+def _resolve_line_format(line_file_path, file_format):
+    """Decide whether a line file is read as EVL or CSV.
+
+    Args:
+        line_file_path (str | Path | list): The path, folder or list given.
+        file_format (str): "auto", "evl" or "csv".
+
+    Returns:
+        str: "evl" or "csv".
+
+    Raises:
+        ValueError: If *file_format* is not one of the three accepted values.
+    """
+    if file_format in ("evl", "csv"):
+        return file_format
+    if file_format != "auto":
+        raise ValueError(
+            f"file_format must be 'auto', 'evl' or 'csv', got {file_format!r}"
+        )
+
+    # A list or a folder is only ever the EVL reader's shape, and a folder has
+    # no extension to read, so anything that is not plainly a .csv file is left
+    # to the EVL path to accept or reject.
+    candidate = line_file_path[0] if isinstance(line_file_path, (list, tuple)) else line_file_path
+    return "csv" if str(candidate).lower().endswith(".csv") else "evl"
 
 
 def create_seafloor_mask(ds_Sv, seafloor_depth, seafloor_buffer_m=0.0, range_var=None):
@@ -2141,24 +2551,23 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
     a future ``map_over`` step will dispatch, and it must stay picklable for
     the Dask/Prefect executors.
 
-    Prints one line before parsing and one after writing. This is the record of
-    how far a conversion got when a later file fails, and of whether echopype
-    switched to swap mode partway through, so it is not gated behind a flag.
+    Logs progress before parsing and after writing at DEBUG level. This records
+    how far a conversion got when a later file fails and whether echopype
+    switched to swap mode without cluttering ordinary run output.
     """
     label = Path(local_raw_path).name
     try:
         raw_size = f", raw {_fmt_gib(Path(local_raw_path).stat().st_size)}"
     except OSError:
         raw_size = ""
-    print(f"  open_raw {label}{raw_size}{_memory_note()}", flush=True)
+    logger.debug(f"  open_raw {label}{raw_size}{_memory_note()}")
 
     parse_start = time.perf_counter()
     ed = ep.open_raw(local_raw_path, sonar_model=sonar_model,
                      include_bot=include_bot, use_swap=use_swap)
-    print(
+    logger.debug(
         f"  parsed {label} in {time.perf_counter() - parse_start:.1f}s"
-        f"{_swap_note(ed)}",
-        flush=True,
+        f"{_swap_note(ed)}"
     )
 
     if intermediate_format == "none":
@@ -2169,9 +2578,8 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
         return str(store_path)
 
     store_path = _storage.join(store_dir, f"{local_raw_path.stem}.zarr")
-    print(
+    logger.debug(
         f"  writing {store_path}{_free_disk_note(store_dir)}",
-        flush=True,
     )
     write_start = time.perf_counter()
     # Match the checkpoint writer exactly: zarr_format=2 and compress=False.
@@ -2217,10 +2625,9 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
                                compress=False, overwrite=True),
             store_path,
         )
-    print(
+    logger.debug(
         f"  wrote {label} in {time.perf_counter() - write_start:.1f}s"
-        f"{_store_size_note(store_path)}{_free_disk_note(store_dir)}",
-        flush=True,
+        f"{_store_size_note(store_path)}{_free_disk_note(store_dir)}"
     )
     return str(store_path)
 
@@ -2298,9 +2705,9 @@ def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=Tru
     results = []
     total = len(raw_file_paths)
     if store_dir is not None:
-        print(f"Intermediate stores: {store_dir}{_free_disk_note(store_dir)}")
+        logger.debug(f"Intermediate stores: {store_dir}{_free_disk_note(store_dir)}")
     for index, raw_path in enumerate(raw_file_paths, start=1):
-        print(f"[{index}/{total}] {Path(str(raw_path)).name}", flush=True)
+        logger.debug(f"[{index}/{total}] {Path(str(raw_path)).name}")
         if _storage.is_remote(raw_path):
             with _storage.localized_file(
                 str(raw_path),
@@ -2319,7 +2726,7 @@ def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=Tru
                 intermediate_format, store_dir, store_options, remote,
             ))
 
-    print(f"Read {len(raw_file_paths)} raw file(s) to '{intermediate_format}' format")
+    logger.debug(f"Read {len(raw_file_paths)} raw file(s) to '{intermediate_format}' format")
     return results
 
 
@@ -2374,8 +2781,8 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
 
     # Phase timing: combine_raw was observed spending minutes here while the
     # downstream checkpoint upload of the finished store is only seconds, so the
-    # cost is in this function. These prints break the wall clock into open /
-    # combine / rechunk so a run log shows which phase dominates.
+    # cost is in this function. DEBUG logs break the wall clock into open /
+    # combine / rechunk without cluttering normal progress output.
     _t0 = time.perf_counter()
     echodata_list = []
     for item in raw_stores:
@@ -2391,16 +2798,18 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
         else:
             # Already an in-memory EchoData object (none mode)
             echodata_list.append(item)
-    print(f"[combine_raw] opened {len(echodata_list)} store(s) in "
-          f"{time.perf_counter() - _t0:.1f}s")
+    logger.debug(
+        f"[combine_raw] opened {len(echodata_list)} store(s) in "
+        f"{time.perf_counter() - _t0:.1f}s"
+    )
 
     _t0 = time.perf_counter()
     if len(echodata_list) == 1:
         echodata = echodata_list[0]
     else:
         echodata = ep.combine_echodata(echodata_list)
-        print(f"Combined {len(echodata_list)} stores into one EchoData object")
-    print(f"[combine_raw] combine_echodata in {time.perf_counter() - _t0:.1f}s")
+        logger.debug(f"Combined {len(echodata_list)} stores into one EchoData object")
+    logger.debug(f"[combine_raw] combine_echodata in {time.perf_counter() - _t0:.1f}s")
 
     # EK80 only: combining N files stacks N filter-coefficient sets onto
     # Vendor_specific.filter_time, which forces echopype's compute_Sv into its
@@ -2430,7 +2839,7 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
                 # list index keeps filter_time as a size-1 dim so echopype's
                 # `len(...) == 1` single-pass gate trips
                 echodata["Vendor_specific"] = _vend.isel(filter_time=[0])
-                print(
+                logger.debug(
                     "[combine_raw] no FM beam group; collapsed Vendor_specific "
                     f"filter_time {_n} -> 1 (WBT/PC coeffs unused in CW)"
                 )
@@ -2482,12 +2891,12 @@ def combine_raw_stores(raw_stores, ping_time_chunk=DEFAULT_PING_TIME_CHUNK):
             ):
                 ds[v].encoding.pop(key, None)
         echodata[group_path] = ds
-    print(f"[combine_raw] rechunk in {time.perf_counter() - _t0:.1f}s")
+    logger.debug(f"[combine_raw] rechunk in {time.perf_counter() - _t0:.1f}s")
 
     _t0 = time.perf_counter()
     check_for_seafloor_depth_data(echodata)
-    print(f"[combine_raw] seafloor check in {time.perf_counter() - _t0:.1f}s")
-    print("EchoData ready for processing")
+    logger.debug(f"[combine_raw] seafloor check in {time.perf_counter() - _t0:.1f}s")
+    logger.debug("EchoData ready for processing")
     return echodata
 
 
@@ -2553,14 +2962,14 @@ def check_for_seafloor_depth_data(ed):
     if 'detected_seafloor_depth' in ed['Vendor_specific']:
         seafloor_depth = ed['Vendor_specific']['detected_seafloor_depth']
         seafloor_depth_values = _computed_values(seafloor_depth)
-        print("Bottom detection data available!")
-        print(f"Min depth: {np.nanmin(seafloor_depth_values):.1f} m")
-        print(f"Max depth: {np.nanmax(seafloor_depth_values):.1f} m")
-        print(f"Mean depth: {np.nanmean(seafloor_depth_values):.1f} m")
-        print(f"Median depth: {np.nanmedian(seafloor_depth_values):.1f} m")
-        print(f"Std deviation: {np.nanstd(seafloor_depth_values):.1f} m")
+        logger.debug("Bottom detection data available!")
+        logger.debug(f"Min depth: {np.nanmin(seafloor_depth_values):.1f} m")
+        logger.debug(f"Max depth: {np.nanmax(seafloor_depth_values):.1f} m")
+        logger.debug(f"Mean depth: {np.nanmean(seafloor_depth_values):.1f} m")
+        logger.debug(f"Median depth: {np.nanmedian(seafloor_depth_values):.1f} m")
+        logger.debug(f"Std deviation: {np.nanstd(seafloor_depth_values):.1f} m")
     else:
-        print("Warning: No bottom detection data found in the raw file. Sv effects not valid!")
+        logger.warning("No bottom detection data found in the raw file. Sv effects not valid!")
         # raise ValueError("Error: No seafloor depth data found in the raw file. Sv effects not valid!")
 
 

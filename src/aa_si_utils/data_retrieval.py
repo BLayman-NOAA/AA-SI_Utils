@@ -595,6 +595,42 @@ def _s3_to_https(cloud_path):
     return cloud_path
 
 
+def ncei_raw_urls(records, suffix=".raw"):
+    """Public HTTPS URLs for the raw files a query's records name.
+
+    For scanning rather than downloading. A step that only needs each file's
+    leading bytes, such as a channel-configuration scan, maps over these and
+    range-reads them in place; nothing is transferred whole and nothing lands
+    on disk.
+
+    The URL is built rather than probed. ``download_ncei_data`` probes because
+    it does not know the extension, which costs a request per file; a raw scan
+    knows it wants the ``.raw`` object, and WCSD stores it beside its ``.bot``
+    and ``.idx`` under the record's own key. A record whose object is not
+    stored that way simply 404s on read, which is louder and cheaper than
+    probing every file to find out.
+
+    Args:
+        records (list[dict] | dict): Records from :func:`query_ncei_data`, or
+            the dict it returns.
+        suffix (str): Extension appended to each record's key. Defaults to
+            ".raw".
+
+    Returns:
+        list[str]: One URL per record that carries a CLOUD_PATH, in order.
+    """
+    if isinstance(records, dict):
+        records = records.get("records", [])
+    urls = []
+    for item in records or []:
+        cloud_path = item.get("CLOUD_PATH")
+        if not cloud_path:
+            continue
+        url = _s3_to_https(cloud_path)
+        urls.append(url if url.endswith(suffix) else url + suffix)
+    return urls
+
+
 def _extract_tar(tar_path, output_dir):
     """Safely extract a tar archive and return the list of extracted paths.
 
@@ -842,7 +878,7 @@ def query_ncei_data(
         items = _fetch_all_pages(params)
     except requests.exceptions.RequestException as exc:
         print(f"Network error: {exc}")
-        return {"records": [], "query_label": query_label}
+        return {"records": [], "query_label": query_label, "raw_urls": []}
 
     # Enrich with FILE_DATETIME
     for item in items:
@@ -901,7 +937,11 @@ def query_ncei_data(
     print(f"Query returned {len(items)} result(s). Label: {query_label}")
     for item in items:
         print(f"  {item.get('FILE_NAME', '<unknown>')}")
-    return {"records": items, "query_label": query_label}
+    return {
+        "records": items,
+        "query_label": query_label,
+        "raw_urls": ncei_raw_urls(items),
+    }
 
 
 def download_ncei_data(
