@@ -293,7 +293,9 @@ def mask_sparse_bins(ds_Sv: xr.Dataset,
 def select_ping_time_range(ds_Sv: xr.Dataset,
                            start: str | None = None,
                            end: str | None = None,
-                           window: Mapping | None = None) -> xr.Dataset:
+                           window: Mapping | None = None,
+                           allow_empty: bool = False,
+                           dim: str = "ping_time") -> xr.Dataset | None:
     """Narrow a Dataset to a ping_time window.
 
     The user-facing entry point into a survey-wide Sv store.  A survey-level
@@ -321,6 +323,18 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
         start: Inclusive ISO datetime lower bound (e.g. "2024-10-15T13:38").
             None leaves the start open.
         end: Inclusive ISO datetime upper bound.  None leaves the end open.
+        dim: Time coordinate to slice.  Defaults to ``ping_time``.  Binned
+            products carry the bin's left edge under a different name, so a
+            per-cell statistics dataset is windowed with
+            ``dim="cell_ping_time"``.  The bounds are compared against whatever
+            that coordinate holds, so it has to be datetime-valued.
+        allow_empty: Return ``None`` instead of raising when the window
+            selects no pings.  This is what lets the step be mapped over a
+            whole survey's per-file Sv: most files lie outside any one window,
+            and ``concat_datasets`` already drops ``None`` entries from a
+            collected list, so the fan-in keeps exactly the files that overlap.
+            Left False by default, because against a single merged store an
+            empty window is a mistake worth failing on.
         window: Mapping supplying ``start`` and ``end`` instead of passing them
             directly, plus an optional ``label`` printed to identify the
             instance.  Mutually exclusive with *start* and *end*.
@@ -332,7 +346,8 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
     Raises:
         TypeError: If *window* is given and is not a mapping.
         ValueError: If *window* is combined with *start* or *end*, if it
-            carries neither bound, if the window selects no pings, or if
+            carries neither bound, if the window selects no pings and
+            *allow_empty* is False, or if
             *start* is after *end*.
     """
     if window is not None:
@@ -364,19 +379,26 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
                 f"start {start!r} is after end {end!r}; the window is empty"
             )
 
-    n_before = ds_Sv.sizes.get("ping_time", 0)
-    windowed = ds_Sv.sel(ping_time=slice(start, end))
-    n_after = windowed.sizes.get("ping_time", 0)
+    if dim not in ds_Sv.dims:
+        raise ValueError(
+            f"dataset has no {dim!r} dimension; dims present: {sorted(ds_Sv.dims)}"
+        )
+    n_before = ds_Sv.sizes.get(dim, 0)
+    windowed = ds_Sv.sel({dim: slice(start, end)})
+    n_after = windowed.sizes.get(dim, 0)
     if n_after == 0:
-        available = ds_Sv["ping_time"].values
+        if allow_empty:
+            return None
+        available = ds_Sv[dim].values
         raise ValueError(
             f"ping_time window {start!r} to {end!r} selects no pings; the "
             f"dataset spans {available[0]} to {available[-1]}"
         )
     print(
-        f"select_ping_time_range: {n_before} -> {n_after} pings "
+        f"select_ping_time_range: {n_before} -> {n_after} "
+        f"{'pings' if dim == 'ping_time' else dim} "
         f"({100 * n_after / n_before:.1f}%), "
-        f"{windowed['ping_time'].values[0]} to {windowed['ping_time'].values[-1]}"
+        f"{windowed[dim].values[0]} to {windowed[dim].values[-1]}"
     )
     return windowed
 

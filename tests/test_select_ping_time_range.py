@@ -128,3 +128,120 @@ def test_reports_the_window(capsys):
     )
     out = capsys.readouterr().out
     assert "100 -> 10 pings" in out
+
+
+# ---------------------------------------------------------------------------
+# allow_empty: mapping the window over a survey's per-file Sv
+# ---------------------------------------------------------------------------
+#
+# Applied to one merged store, a window that selects nothing is a mistake and
+# should fail. Mapped over a survey's per-file Sv it is the normal case: most
+# files lie outside any one window, and the instances that miss have to drop out
+# rather than take the run down with them.
+
+
+def test_allow_empty_returns_none_instead_of_raising():
+    ds = _make_ds_sv(n_pings=20, start="2016-06-27T00:00:00")
+
+    out = utils.select_ping_time_range(
+        ds, start="2016-07-07T00:00:00", end="2016-07-07T01:00:00",
+        allow_empty=True,
+    )
+
+    assert out is None
+
+
+def test_allow_empty_still_returns_the_slice_when_the_window_hits():
+    ds = _make_ds_sv(n_pings=60, start="2016-06-27T00:00:00")
+
+    out = utils.select_ping_time_range(
+        ds, start="2016-06-27T00:00:10", end="2016-06-27T00:00:19",
+        allow_empty=True,
+    )
+
+    assert out is not None
+    assert out.sizes["ping_time"] == 10
+
+
+def test_allow_empty_defaults_off():
+    """A merged-store recipe must keep failing on a window that selects nothing."""
+    ds = _make_ds_sv(n_pings=20, start="2016-06-27T00:00:00")
+
+    with pytest.raises(ValueError, match="selects no pings"):
+        utils.select_ping_time_range(
+            ds, start="2016-07-07T00:00:00", end="2016-07-07T01:00:00"
+        )
+
+
+def test_a_mapped_window_collects_to_only_the_overlapping_files():
+    """The whole point: fan out over the survey, fan in on what the window hits."""
+    per_file = [
+        _make_ds_sv(n_pings=20, start=f"2016-06-27T0{hour}:00:00")
+        for hour in range(6)
+    ]
+    window = {"start": "2016-06-27T02:00:00", "end": "2016-06-27T03:00:19"}
+
+    selected = [
+        utils.select_ping_time_range(ds, window=window, allow_empty=True)
+        for ds in per_file
+    ]
+
+    assert sum(s is None for s in selected) == 4, "non-overlapping files drop out"
+    merged = utils.concat_datasets(selected, dim="ping_time")
+    assert merged.sizes["ping_time"] == 40
+
+
+# ---------------------------------------------------------------------------
+# dim: windowing a binned product
+# ---------------------------------------------------------------------------
+#
+# compute_per_cell_statistics stores its cells on cell_ping_time, holding each
+# bin's left edge as a datetime. Windowing that to a dive needs the same slice
+# against a differently named coordinate.
+
+
+def _ds_cells(n_cells=12, start="2016-06-27T00:00:00", step_s=10):
+    cell_ping_time = np.datetime64(start) + np.arange(
+        0, n_cells * step_s, step_s, dtype="timedelta64[s]"
+    )
+    return xr.Dataset(
+        {"cell_cv": (("channel", "cell_ping_time", "cell_echo_range"),
+                     np.ones((1, n_cells, 4)))},
+        coords={
+            "channel": ["ch0"],
+            "cell_ping_time": cell_ping_time,
+            "cell_echo_range": np.arange(4) * 2.0,
+        },
+    )
+
+
+def test_dim_windows_a_cell_grid():
+    ds = _ds_cells(n_cells=12)
+
+    out = utils.select_ping_time_range(
+        ds, start="2016-06-27T00:00:20", end="2016-06-27T00:00:49",
+        dim="cell_ping_time",
+    )
+
+    assert out.sizes["cell_ping_time"] == 3
+
+
+def test_dim_combines_with_allow_empty():
+    ds = _ds_cells(n_cells=12)
+
+    out = utils.select_ping_time_range(
+        ds, start="2016-07-07T00:00:00", end="2016-07-07T01:00:00",
+        dim="cell_ping_time", allow_empty=True,
+    )
+
+    assert out is None
+
+
+def test_a_missing_dim_is_an_error_not_a_silent_pass_through():
+    """Naming the wrong coordinate must not quietly return everything."""
+    ds = _ds_cells(n_cells=4)
+
+    with pytest.raises(ValueError, match="no 'ping_time' dimension"):
+        utils.select_ping_time_range(
+            ds, start="2016-06-27T00:00:00", end="2016-06-27T00:00:20"
+        )
