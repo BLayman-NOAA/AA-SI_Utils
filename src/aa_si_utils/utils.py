@@ -2147,22 +2147,32 @@ def remove_surface_from_mask(ds_Sv, mask, depth_threshold_m):
 
 def apply_mask_to_sv(ds_Sv, mask, fill_value=np.nan):
     """Apply a boolean mask to the Sv variable in a dataset.
-    
+
+    Fine-resolution Sv goes through ``echopype.mask.apply_mask``, which records
+    its own provenance. That function checks the mask against ``ping_time`` and
+    ``range_sample`` specifically, so it rejects a gridded product: MVBS binned
+    on depth carries a ``depth`` dimension and no ``range_sample`` at all.
+    Masking a grid is the same operation on a different axis, so it falls back
+    to ``where`` rather than being an error.
+
     Args:
         ds_Sv (xr.Dataset): Sv dataset to mask.
         mask (xr.DataArray): Boolean mask (True = keep, False = exclude).
         fill_value: Value to assign where mask is False (default: ``np.nan``).
-    
+
     Returns:
         xr.Dataset: Masked copy of *ds_Sv*.
     """
-    ed_masked = ep.mask.apply_mask(
+    if "range_sample" not in ds_Sv.dims:
+        masked = ds_Sv.copy()
+        masked["Sv"] = ds_Sv["Sv"].where(mask, fill_value)
+        return masked
+    return ep.mask.apply_mask(
         source_ds=ds_Sv,
         mask=mask,
         var_name="Sv",
         fill_value=fill_value
     )
-    return ed_masked
 
 
 def create_data_mask(echodata, ds_Sv, seafloor_buffer_m=10.0, surface_depth_m=10.0, frequencies_to_mask=None):
