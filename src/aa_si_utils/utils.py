@@ -2529,6 +2529,61 @@ def _swap_note(ed):
     return ", backscatter_r dask-backed (swap)" if chunks else ""
 
 
+def _zarr_writable_chunks(ed):
+    """Square up any group whose dask chunks zarr would refuse to write.
+
+    echopype's swap path builds a group's arrays from the blocks it spilled, so
+    a file whose datagrams did not arrive in equal runs comes back ragged along
+    ``ping_time`` -- ``(169, 1, 1)`` on one HB1603 file -- and zarr rejects any
+    dimension whose interior chunks differ or whose last chunk is the largest.
+    Whether swap runs at all is decided per file from live memory, so the same
+    file can write cleanly on one run and fail on the next, which makes this a
+    latent failure rather than a property of the data.
+
+    Only offending dimensions are rechunked, each to its own largest existing
+    block, so a dimension zarr already accepts is left alone.  That matters for
+    the per-channel blocking swap produces: ``(1, 1, 1, 1, 1)`` is uniform and
+    legal, and collapsing it would multiply the per-chunk footprint by the
+    channel count during the write -- the memory swap exists to avoid.
+    ``ping_time`` is additionally capped at :data:`DEFAULT_PING_TIME_CHUNK` so a
+    pathological file cannot land the whole time axis in one block.
+
+    A no-op without swap: those arrays are numpy and carry no chunks at all.
+
+    Also a no-op on anything that does not expose group_paths.  This runs on
+    an object echopype handed us, and a pre-write fixup must not invent a new
+    way for a sound conversion to fail: skipping only means a ragged store hits
+    zarr's own error at the write, which is exactly where it landed before this
+    existed.
+    """
+    group_paths = getattr(ed, "group_paths", None)
+    if group_paths is None:
+        logger.debug("  chunk check skipped: object exposes no group_paths")
+        return
+    for group_path in group_paths:
+        ds = ed[group_path]
+        if ds is None:
+            continue
+        problem = {}
+        for var in ds.variables.values():
+            if var.chunks is None:  # numpy-backed: nothing to square up
+                continue
+            for dim, dim_chunks in zip(var.dims, var.chunks):
+                if len(dim_chunks) <= 1:
+                    continue
+                first = dim_chunks[0]
+                interior_uniform = all(c == first for c in dim_chunks[:-1])
+                if interior_uniform and dim_chunks[-1] <= first:
+                    continue
+                problem[dim] = max(problem.get(dim, 0), max(dim_chunks))
+        if not problem:
+            continue
+        if "ping_time" in problem:
+            problem["ping_time"] = min(problem["ping_time"], DEFAULT_PING_TIME_CHUNK)
+        ed[group_path] = ds.chunk(problem)
+        logger.debug(f"  squared up {group_path} chunks for zarr: {problem}")
+
+
 def _release_swap_files(ed, label=""):
     """Delete the swap zarr stores echopype created for *ed*, if it made any.
 
@@ -2612,6 +2667,9 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
             f"  writing {store_path}{_free_disk_note(store_dir)}",
         )
         write_start = time.perf_counter()
+        # echopype's swap path can hand back chunks zarr refuses; see
+        # _zarr_writable_chunks. Cheap and a no-op when swap did not run.
+        _zarr_writable_chunks(ed)
         # Match the checkpoint writer exactly: zarr_format=2 and compress=False.
         # Writing v3 encodes echopype's fixed-length UTF-32 string metadata
         # with a v3 serializer the v2 checkpoint write cannot express

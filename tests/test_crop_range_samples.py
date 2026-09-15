@@ -148,13 +148,17 @@ def test_outlier_margin_controls_sensitivity():
     assert loose.sizes["range_sample"] > tight.sizes["range_sample"]
 
 
-def test_outlier_rejection_reports_flagged_pings(capsys):
+def test_outlier_rejection_reports_flagged_pings(caplog, capsys):
+    """The rejection summary is debug logging, not terminal output."""
+    caplog.set_level("DEBUG", logger="aa_si_utils.utils")
+
     ds = _make_ds_with_outlier(n_range=40, normal_deepest=10, outlier_deepest=35,
                                n_outliers=3)
     utils.crop_range_samples(ds, outlier_sigma=3.0, outlier_margin=1.5)
-    out = capsys.readouterr().out
-    assert "flagged 3 of 200 pings" in out
-    assert "dropped" in out and "finite sample" in out
+
+    assert "flagged 3 of 200 pings" in caplog.text
+    assert "dropped" in caplog.text and "finite sample" in caplog.text
+    assert capsys.readouterr().out == ""
 
 
 def test_outlier_rejection_takes_precedence_over_lossless():

@@ -183,7 +183,7 @@ def test_partial_store_is_cleared_before_each_attempt(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_read_raw_reports_progress_per_file(tmp_path, monkeypatch, capsys):
+def test_read_raw_reports_progress_per_file(tmp_path, monkeypatch, caplog, capsys):
     from aa_recipe_manager.executor.runtime_context import execution_context
 
     class _StubEchoData:
@@ -202,12 +202,14 @@ def test_read_raw_reports_progress_per_file(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(utils.ep, "open_raw", lambda *a, **k: _StubEchoData())
 
+    caplog.set_level("DEBUG", logger="aa_si_utils.utils")
+
     with execution_context(mode="direct", temp_dir=str(tmp_path / "exe_temp")):
         utils.read_raw_files_to_stores(
             raw_files, sonar_model="EK60", intermediate_format="zarr"
         )
 
-    out = capsys.readouterr().out
+    out = caplog.text
     # Which file, in what order, and how far the loop got.
     assert "[1/2] D20160725-T210000.raw" in out
     assert "[2/2] D20160725-T214425.raw" in out
@@ -217,3 +219,5 @@ def test_read_raw_reports_progress_per_file(tmp_path, monkeypatch, capsys):
     # The context that distinguishes a full disk from a permission problem.
     assert "free disk" in out
     assert "RAM " in out
+    # Progress is debug logging, so it must not reach the terminal.
+    assert capsys.readouterr().out == ""
