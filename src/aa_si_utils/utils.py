@@ -2529,6 +2529,31 @@ def _swap_note(ed):
     return ", backscatter_r dask-backed (swap)" if chunks else ""
 
 
+def _release_swap_files(ed, label=""):
+    """Delete the swap zarr stores echopype created for *ed*, if it made any.
+
+    echopype frees these from ``EchoData.__del__``, but only when
+    ``converted_raw_path`` is None, and its ``to_file`` sets that attribute the
+    moment the object is written.  Every EchoData written to an intermediate
+    store therefore keeps its swap directory under the system temp dir forever,
+    and the leak is per file rather than per concurrent instance: a survey of
+    thousands of files fills the temp disk and the run dies on ENOSPC far from
+    the cause.
+
+    Called once the intermediate store is written, where nothing reads *ed*
+    again, so this does not depend on when the interpreter collects it -- which
+    ``__del__`` did, and which never ran at all when a run was killed.
+
+    A no-op when swap was not used: the cleanup only touches variables backed by
+    dask arrays, and without swap they are numpy.  Never raises; a file that has
+    been converted must not be failed by its own cleanup.
+    """
+    try:
+        ed.cleanup_swap_files()
+    except Exception as exc:
+        logger.debug(f"  swap cleanup skipped for {label}: {exc}")
+
+
 def _store_size_note(store_path):
     """On-disk size of a written store, or '' when it cannot be measured."""
     try:
@@ -2572,64 +2597,71 @@ def _open_and_store(local_raw_path, sonar_model, include_bot, use_swap,
 
     if intermediate_format == "none":
         return ed
-    if intermediate_format == "netcdf":
-        store_path = store_dir / f"{local_raw_path.stem}.nc"
-        ed.to_netcdf(save_path=store_path)
-        return str(store_path)
 
-    store_path = _storage.join(store_dir, f"{local_raw_path.stem}.zarr")
-    logger.debug(
-        f"  writing {store_path}{_free_disk_note(store_dir)}",
-    )
-    write_start = time.perf_counter()
-    # Match the checkpoint writer exactly: zarr_format=2 and compress=False.
-    # Writing v3 encodes echopype's fixed-length UTF-32 string metadata
-    # with a v3 serializer the v2 checkpoint write cannot express
-    # ("Zarr format 2 arrays do not support serializer").  Leaving
-    # compression on makes echopype attach a zarr-v3 BloscCodec that a
-    # v2 write also rejects ("Invalid compressor ... Got BloscCodec");
-    # compress=False sidesteps it, consistent with the checkpoint store.
-    if remote:
-        # echopype 0.11.1 cannot write a zarr to a remote store: its save_file()
-        # hands the protocol-stripped fsspec mapper root (e.g. "bucket/key.zarr")
-        # to xarray.to_zarr with no filesystem, so a gs:// save_path silently
-        # becomes a LOCAL relative write and never reaches the bucket.
-        #
-        # A per-file store is one raw file's worth of data, so stage it on local
-        # scratch (fast, and echopype writes consolidated metadata so it reopens
-        # quickly) and bulk-upload with fs.put, which parallelizes the many small
-        # zarr objects — ~10x faster than a sequential per-chunk remote write.
-        # Local disk holds only this one store, then it is deleted.
-        import tempfile
-        scratch = Path(tempfile.mkdtemp(prefix="aa_si_zarr_"))
-        try:
-            local_store = scratch / f"{local_raw_path.stem}.zarr"
-            _write_store_with_retry(
-                lambda: ed.to_zarr(save_path=local_store, zarr_format=2,
-                                   compress=False, overwrite=True),
-                local_store,
-            )
-            _storage.remove_store(store_path, store_options)  # clear stale store
-            _storage.get_fs(store_path, store_options).put(
-                str(local_store), str(store_path), recursive=True)
-        finally:
-            _storage._rmtree_local(scratch)
-    else:
-        # overwrite=True matches the remote branch above. Without it, echopype's
-        # to_file() logs "already exists, will not overwrite" and returns
-        # WITHOUT writing whenever the store still exists, so a store this
-        # function only partly removed would be reported as a success and fail
-        # much later, in combine_raw, as a corrupt store.
-        _write_store_with_retry(
-            lambda: ed.to_zarr(save_path=store_path, zarr_format=2,
-                               compress=False, overwrite=True),
-            store_path,
+    # echopype leaks this file's swap zarr once the EchoData is written; see
+    # _release_swap_files. Released in a finally so a failed write does not
+    # strand it either.
+    try:
+        if intermediate_format == "netcdf":
+            store_path = store_dir / f"{local_raw_path.stem}.nc"
+            ed.to_netcdf(save_path=store_path)
+            return str(store_path)
+
+        store_path = _storage.join(store_dir, f"{local_raw_path.stem}.zarr")
+        logger.debug(
+            f"  writing {store_path}{_free_disk_note(store_dir)}",
         )
-    logger.debug(
-        f"  wrote {label} in {time.perf_counter() - write_start:.1f}s"
-        f"{_store_size_note(store_path)}{_free_disk_note(store_dir)}"
-    )
-    return str(store_path)
+        write_start = time.perf_counter()
+        # Match the checkpoint writer exactly: zarr_format=2 and compress=False.
+        # Writing v3 encodes echopype's fixed-length UTF-32 string metadata
+        # with a v3 serializer the v2 checkpoint write cannot express
+        # ("Zarr format 2 arrays do not support serializer").  Leaving
+        # compression on makes echopype attach a zarr-v3 BloscCodec that a
+        # v2 write also rejects ("Invalid compressor ... Got BloscCodec");
+        # compress=False sidesteps it, consistent with the checkpoint store.
+        if remote:
+            # echopype 0.11.1 cannot write a zarr to a remote store: its save_file()
+            # hands the protocol-stripped fsspec mapper root (e.g. "bucket/key.zarr")
+            # to xarray.to_zarr with no filesystem, so a gs:// save_path silently
+            # becomes a LOCAL relative write and never reaches the bucket.
+            #
+            # A per-file store is one raw file's worth of data, so stage it on local
+            # scratch (fast, and echopype writes consolidated metadata so it reopens
+            # quickly) and bulk-upload with fs.put, which parallelizes the many small
+            # zarr objects — ~10x faster than a sequential per-chunk remote write.
+            # Local disk holds only this one store, then it is deleted.
+            import tempfile
+            scratch = Path(tempfile.mkdtemp(prefix="aa_si_zarr_"))
+            try:
+                local_store = scratch / f"{local_raw_path.stem}.zarr"
+                _write_store_with_retry(
+                    lambda: ed.to_zarr(save_path=local_store, zarr_format=2,
+                                       compress=False, overwrite=True),
+                    local_store,
+                )
+                _storage.remove_store(store_path, store_options)  # clear stale store
+                _storage.get_fs(store_path, store_options).put(
+                    str(local_store), str(store_path), recursive=True)
+            finally:
+                _storage._rmtree_local(scratch)
+        else:
+            # overwrite=True matches the remote branch above. Without it, echopype's
+            # to_file() logs "already exists, will not overwrite" and returns
+            # WITHOUT writing whenever the store still exists, so a store this
+            # function only partly removed would be reported as a success and fail
+            # much later, in combine_raw, as a corrupt store.
+            _write_store_with_retry(
+                lambda: ed.to_zarr(save_path=store_path, zarr_format=2,
+                                   compress=False, overwrite=True),
+                store_path,
+            )
+        logger.debug(
+            f"  wrote {label} in {time.perf_counter() - write_start:.1f}s"
+            f"{_store_size_note(store_path)}{_free_disk_note(store_dir)}"
+        )
+        return str(store_path)
+    finally:
+        _release_swap_files(ed, label)
 
 
 def read_raw_files_to_stores(raw_file_paths, sonar_model="EK60", include_bot=True,
