@@ -3161,7 +3161,52 @@ def _restore_provenance_vars(merged, items, dim):
     return merged
 
 
-def concat_datasets(datasets, dim="ping_time", **kwargs):
+def _combine_duplicate_labels(ds, dim):
+    """Average entries sharing a label on *dim* into one.
+
+    Segment-parallel binning produces these at every segment boundary: both
+    compute_MVBS and compute_per_cell_statistics anchor their time bins to a
+    global origin, so a boundary falling inside a bin makes the segment on each
+    side emit that bin, each holding part of its pings. Concatenating leaves two
+    entries with one label, which is a duplicate index every downstream reindex
+    rejects.
+
+    Variables carrying ``units: dB`` are averaged in the linear domain and
+    converted back, since a mean of decibels is not the mean of what they
+    measure. Everything else is averaged arithmetically. The average is
+    unweighted: the partial bins do not record how many pings each contributed,
+    so a boundary bin is biased toward whichever side held fewer.
+
+    Variables without *dim* are carried through untouched.
+    """
+    if dim not in ds.indexes or ds.indexes[dim].is_unique:
+        return ds
+
+    combined = {}
+    for name, da in ds.data_vars.items():
+        if dim not in da.dims:
+            continue
+        in_db = str(da.attrs.get("units", "")).lower() == "db"
+        work = 10.0 ** (da / 10.0) if in_db else da
+        rolled = work.groupby(dim).mean(dim)
+        if in_db:
+            rolled = 10.0 * np.log10(rolled)
+        rolled.attrs = dict(da.attrs)
+        combined[name] = rolled
+
+    out = xr.Dataset(combined)
+    for name, da in ds.data_vars.items():
+        if dim not in da.dims:
+            out[name] = da
+    for name, coord in ds.coords.items():
+        if name not in out.coords and dim not in coord.dims:
+            out = out.assign_coords({name: coord})
+    out.attrs = dict(ds.attrs)
+    return out
+
+
+def concat_datasets(datasets, dim="ping_time", on_duplicate=None,
+                    **kwargs):
     """Concatenate a list of xarray Datasets along a dimension.
 
     Reconsolidation (fan-in) helper for the recipe system's ``collect``
@@ -3197,6 +3242,11 @@ def concat_datasets(datasets, dim="ping_time", **kwargs):
     Args:
         datasets: A list of ``xarray.Dataset`` objects, or a single Dataset.
         dim: Dimension to concatenate along. Defaults to ``"ping_time"``.
+        on_duplicate: What to do when segments share a label on *dim*.
+            ``None`` (default) leaves them, which is right when the segments
+            cannot overlap. ``"mean"`` averages them into one entry, which is
+            what a fan-in over per-segment *binned* products needs: see
+            :func:`_combine_duplicate_labels`.
         **kwargs: Forwarded to :func:`xarray.concat`, and override the
             defaults set here.
 
@@ -3229,5 +3279,12 @@ def concat_datasets(datasets, dim="ping_time", **kwargs):
         # fan-in shape, so it must keep working.
         concat_kwargs = dict(kwargs)
     merged = xr.concat(items, dim=dim, **concat_kwargs)
-    return _restore_provenance_vars(merged, items, dim)
+    merged = _restore_provenance_vars(merged, items, dim)
+    if on_duplicate == "mean":
+        merged = _combine_duplicate_labels(merged, dim)
+    elif on_duplicate is not None:
+        raise ValueError(
+            f"on_duplicate must be None or 'mean', got {on_duplicate!r}"
+        )
+    return merged
 
