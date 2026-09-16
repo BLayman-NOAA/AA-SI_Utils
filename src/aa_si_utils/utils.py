@@ -1884,9 +1884,18 @@ def create_surface_mask(ds_Sv, surface_depth_m=0.0):
 
 
 def create_frequency_mask(ds_Sv, frequencies_to_mask=None):
-    """Create a boolean mask that excludes selected frequency channels."""
+    """Create a boolean mask that excludes selected frequency channels.
+
+    The decision is one boolean per channel. It is combined with a lazy
+    all-true template rather than broadcast directly, because
+    ``broadcast_like`` against a dask-backed Sv returns a *numpy* array of the
+    full three-dimensional shape: a handful of booleans materialized into tens
+    of megabytes, which then travels by value inside every downstream dask
+    graph and back to the client for every mapped instance.
+    """
+    keep = xr.ones_like(ds_Sv["Sv"], dtype=bool)
     if not frequencies_to_mask:
-        return xr.ones_like(ds_Sv["Sv"], dtype=bool)
+        return keep
 
     target_frequencies = {int(float(freq)) for freq in frequencies_to_mask}
     channel_keep = []
@@ -1899,7 +1908,7 @@ def create_frequency_mask(ds_Sv, frequencies_to_mask=None):
         coords={"channel": ds_Sv["channel"]},
         dims=["channel"],
     )
-    return channel_mask.broadcast_like(ds_Sv["Sv"])
+    return keep & channel_mask
 
 
 def combine_masks(masks, mode="and"):
