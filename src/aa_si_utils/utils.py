@@ -3205,6 +3205,29 @@ def _combine_duplicate_labels(ds, dim):
     return out
 
 
+def _drop_duplicate_labels(ds, dim):
+    """Keep the first entry for each label on *dim* and sort the result.
+
+    For segments that are slices of one shared store, entries sharing a label
+    are the same cells twice, so the first is the whole answer and nothing is
+    averaged. A per-segment variable that genuinely differs on the overlap, a
+    dive's own depth profile for instance, is kept from the first segment only,
+    which is the sign it does not belong on a shared axis at all: attach it per
+    segment after the fan-in instead.
+
+    The result is sorted as well. Segments that overlap are usually also out of
+    order once concatenated, and a slice-select on *dim* needs a monotonic index
+    as much as a unique one.
+    """
+    if dim not in ds.indexes:
+        return ds
+    index = ds.indexes[dim]
+    if index.is_unique and index.is_monotonic_increasing:
+        return ds
+    keep = np.flatnonzero(~index.duplicated(keep="first"))
+    return ds.isel({dim: keep}).sortby(dim)
+
+
 def concat_datasets(datasets, dim="ping_time", on_duplicate=None,
                     **kwargs):
     """Concatenate a list of xarray Datasets along a dimension.
@@ -3246,7 +3269,9 @@ def concat_datasets(datasets, dim="ping_time", on_duplicate=None,
             ``None`` (default) leaves them, which is right when the segments
             cannot overlap. ``"mean"`` averages them into one entry, which is
             what a fan-in over per-segment *binned* products needs: see
-            :func:`_combine_duplicate_labels`.
+            :func:`_combine_duplicate_labels`. ``"first"`` keeps the first and
+            sorts, which is what a fan-in over overlapping *slices of one
+            store* needs: see :func:`_drop_duplicate_labels`.
         **kwargs: Forwarded to :func:`xarray.concat`, and override the
             defaults set here.
 
@@ -3282,9 +3307,11 @@ def concat_datasets(datasets, dim="ping_time", on_duplicate=None,
     merged = _restore_provenance_vars(merged, items, dim)
     if on_duplicate == "mean":
         merged = _combine_duplicate_labels(merged, dim)
+    elif on_duplicate == "first":
+        merged = _drop_duplicate_labels(merged, dim)
     elif on_duplicate is not None:
         raise ValueError(
-            f"on_duplicate must be None or 'mean', got {on_duplicate!r}"
+            f"on_duplicate must be None, 'mean' or 'first', got {on_duplicate!r}"
         )
     return merged
 

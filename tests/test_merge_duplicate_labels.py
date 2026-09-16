@@ -120,4 +120,89 @@ def test_a_lazy_input_stays_lazy():
 def test_an_unknown_policy_is_rejected():
     with pytest.raises(ValueError, match="on_duplicate"):
         concat_datasets([_segment([4], [-80.0]), _segment([5], [-70.0])],
-                        dim="ping_time", on_duplicate="first")
+                        dim="ping_time", on_duplicate="median")
+
+
+# ---------------------------------------------------------------------------
+# on_duplicate="first": overlapping slices of one store
+# ---------------------------------------------------------------------------
+
+
+def _overlapping_dives():
+    """Two dive windows cut from one store, overlapping on two bins.
+
+    Concatenated A then B, so the raw index is both duplicated and
+    non-monotonic. Sv is identical on the overlap, as slices of one store are;
+    ``dive_fit`` is a per-dive line and genuinely differs.
+    """
+    import pandas as pd
+
+    t = pd.date_range("2016-07-25T21:20:00", periods=6, freq="10s")
+    a = xr.Dataset(
+        {"Sv": ("ping_time", [-60.0, -61.0, -62.0, -63.0]),
+         "dive_fit": ("ping_time", [100.0, 110.0, 120.0, 130.0])},
+        coords={"ping_time": t[:4]},
+    )
+    b = xr.Dataset(
+        {"Sv": ("ping_time", [-62.0, -63.0, -64.0, -65.0]),
+         "dive_fit": ("ping_time", [500.0, 510.0, 520.0, 530.0])},
+        coords={"ping_time": t[2:]},
+    )
+    a["Sv"].attrs["units"] = "dB"
+    b["Sv"].attrs["units"] = "dB"
+    return a, b, t
+
+
+def test_first_makes_the_index_unique_and_monotonic():
+    a, b, t = _overlapping_dives()
+    out = concat_datasets([a, b], dim="ping_time", on_duplicate="first")
+
+    index = out.indexes["ping_time"]
+    assert index.is_unique
+    assert index.is_monotonic_increasing
+    assert list(index) == list(t)
+
+
+def test_first_keeps_identical_values_bit_for_bit():
+    """No arithmetic, so no dB round trip: slices of one store come back exact."""
+    a, b, _ = _overlapping_dives()
+    out = concat_datasets([a, b], dim="ping_time", on_duplicate="first")
+
+    np.testing.assert_array_equal(out["Sv"].values, [-60, -61, -62, -63, -64, -65])
+    assert out["Sv"].attrs["units"] == "dB"
+
+
+def test_first_does_not_average_a_per_segment_variable():
+    """The overlap keeps the FIRST dive's line, not a blend of the two.
+
+    That is the right behaviour for a dedup and the wrong place for a
+    per-dive variable, which is why the recipe attaches dive lines after the
+    fan-in rather than before it. Pinned so the choice is explicit.
+    """
+    a, b, _ = _overlapping_dives()
+    out = concat_datasets([a, b], dim="ping_time", on_duplicate="first")
+
+    np.testing.assert_array_equal(
+        out["dive_fit"].values, [100, 110, 120, 130, 520, 530]
+    )
+
+
+def test_first_on_the_same_input_as_mean_gives_the_same_sv():
+    a, b, _ = _overlapping_dives()
+    first = concat_datasets([a, b], dim="ping_time", on_duplicate="first")
+    mean = concat_datasets([a, b], dim="ping_time", on_duplicate="mean")
+
+    np.testing.assert_allclose(first["Sv"].values, mean["Sv"].values, rtol=1e-12)
+
+
+def test_first_is_a_no_op_on_a_clean_index():
+    a, _, _ = _overlapping_dives()
+    out = concat_datasets([a, a.assign_coords(ping_time=a.ping_time + np.timedelta64(40, "s"))],
+                          dim="ping_time", on_duplicate="first")
+    assert out.sizes["ping_time"] == 8
+
+
+def test_first_stays_lazy():
+    a, b, _ = _overlapping_dives()
+    out = concat_datasets([a.chunk(), b.chunk()], dim="ping_time", on_duplicate="first")
+    assert out["Sv"].chunks is not None

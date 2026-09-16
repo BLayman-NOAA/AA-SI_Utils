@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .utils import _parse_evl
+from .utils import _parse_evl, add_line_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,13 @@ def generate_sv_codes(
 
     Args:
         ds (xr.Dataset): Embedded clustering result, carrying the gridded cluster
-            labels, the Sv the codes describe, and the three dive lines.
+            labels and the Sv the codes describe. It may also carry the three
+            dive lines; when it does not, each dive's lines are read onto its
+            own slice from the files its window names (``dive_fit_evl``,
+            ``dive_u99_evl``, ``dive_l99_evl``). That is the form to use once
+            dives overlap in time: two whales under the ship at once have two
+            depths for one ping, and a ``(ping_time,)`` variable on the
+            combined dataset can hold one.
         windows (list): Window dicts from :func:`plan_dive_datasets`. Each one's
             ping_time span selects its dive out of the combined dataset.
         output_dir (str | Path): Folder the CSVs are written into.
@@ -117,7 +123,8 @@ def generate_sv_codes(
         :func:`sv_code_depth_table`), and ``dive_labels``.
 
     Raises:
-        KeyError: If the label grid or a dive line is missing from *ds*.
+        KeyError: If the label grid is missing from *ds*, or a dive line is
+            missing from *ds* and its window names no file for it.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -129,12 +136,11 @@ def generate_sv_codes(
             f"Run embed_clustering_results first, or pass label_grid_var. "
             f"Available: {sorted(ds.data_vars)}"
         )
-    for name in (dive_fit_var, upper_var, lower_var):
-        if name not in ds:
-            raise KeyError(
-                f"Dive line {name!r} not in the dataset; attach it with "
-                f"the add_line_overlay op before generating codes"
-            )
+    line_keys = {
+        dive_fit_var: "dive_fit_evl",
+        upper_var: "dive_u99_evl",
+        lower_var: "dive_l99_evl",
+    }
 
     csv_paths = []
     summaries = []
@@ -145,6 +151,7 @@ def generate_sv_codes(
         if subset.sizes.get("ping_time", 0) == 0:
             logger.warning("%s: no pings in the dataset for this window", label)
             continue
+        subset = _attach_dive_lines(subset, window, line_keys)
 
         cells, per_ping = _codes_for_one_dive(
             subset, label, label_grid_var, range_var, data_var,
@@ -184,6 +191,26 @@ def generate_sv_codes(
         "summary_csv_path": summary_path.as_posix(),
         "dive_labels": labels_written,
     }
+
+
+def _attach_dive_lines(ds, window, line_keys):
+    """Attach this dive's lines to its own slice, from the window's files.
+
+    Lines already on *ds* are left alone, so a dataset that carried them in
+    from an earlier step still works. A line that is on neither is an error.
+    """
+    for name, key in line_keys.items():
+        if name in ds:
+            continue
+        if not window.get(key):
+            raise KeyError(
+                f"Dive line {name!r} not in the dataset, and window "
+                f"{window.get('label', '<unlabelled>')!r} names no file under "
+                f"{key!r}; attach it with the add_line_overlay op or add the "
+                f"path to the window"
+            )
+        ds = add_line_overlay(ds, window=window, window_key=key, line_name=name)
+    return ds
 
 
 def _codes_for_one_dive(

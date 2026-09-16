@@ -14,9 +14,10 @@ PING_BIN_S = 10.0
 
 
 def _ds(n_pings=6, depths=(100.0, 200.0, 300.0, 400.0, 500.0),
-        labels=None, fit=300.0, half_band=120.0, freqs=(18000.0, 38000.0)):
+        labels=None, fit=300.0, half_band=120.0, freqs=(18000.0, 38000.0),
+        with_lines=True, start="2016-07-07T19:49:00"):
     """MVBS-shaped dataset with a gridded label field and three dive lines."""
-    ping_time = pd.date_range("2016-07-07T19:49:00", periods=n_pings, freq="10s")
+    ping_time = pd.date_range(start, periods=n_pings, freq="10s")
     depth = np.array(depths, dtype=float)
     shape = (len(ping_time), len(depth))
 
@@ -29,15 +30,17 @@ def _ds(n_pings=6, depths=(100.0, 200.0, 300.0, 400.0, 500.0),
     ])
     fitted = np.full(len(ping_time), fit, dtype=float)
 
+    data = {
+        "Sv": (("channel", "ping_time", "depth"), sv),
+        "frequency_nominal": (("channel",), np.array(freqs)),
+        "ml_dataset_hdbscan_results_grid": (("ping_time", "depth"), labels),
+    }
+    if with_lines:
+        data["dive_fit"] = (("ping_time",), fitted)
+        data["dive_u99"] = (("ping_time",), fitted - half_band)
+        data["dive_l99"] = (("ping_time",), fitted + half_band)
     return xr.Dataset(
-        {
-            "Sv": (("channel", "ping_time", "depth"), sv),
-            "frequency_nominal": (("channel",), np.array(freqs)),
-            "ml_dataset_hdbscan_results_grid": (("ping_time", "depth"), labels),
-            "dive_fit": (("ping_time",), fitted),
-            "dive_u99": (("ping_time",), fitted - half_band),
-            "dive_l99": (("ping_time",), fitted + half_band),
-        },
+        data,
         coords={
             "channel": np.array([f"ch{i}" for i in range(len(freqs))]),
             "ping_time": ping_time,
@@ -507,3 +510,82 @@ def test_uncoded_pings_land_in_their_own_depth_interval(tmp_path):
     uncoded = per_dive[per_dive["code"] == dive_profiles.UNCODED]
     assert list(uncoded["depth_interval_m"]) == ["200-400"]
     assert uncoded["percent_of_dive"].iloc[0] == pytest.approx(50.0)
+
+
+# ---------------------------------------------------------------------------
+# Dive lines read per dive, from the window's own files
+# ---------------------------------------------------------------------------
+
+
+def _write_flat_evl(path, times, depth):
+    """A minimal Echoview .evl holding *depth* at every one of *times*."""
+    lines = ["EVBD 3 15.1.65.0", str(len(times))]
+    for when in times:
+        stamp = pd.Timestamp(when)
+        lines.append(
+            f"{stamp:%Y%m%d} {stamp:%H%M%S}{stamp.microsecond // 100:04d}  "
+            f"{depth} 3"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    return path
+
+
+def _window_with_lines(tmp_path, ds, label, start, end, fit, half_band):
+    """A window naming three flat line files spanning [start, end]."""
+    times = ds["ping_time"].sel(ping_time=slice(start, end)).values
+    return {
+        "label": label,
+        "start": pd.Timestamp(start).isoformat(),
+        "end": pd.Timestamp(end).isoformat(),
+        "dive_fit_evl": _write_flat_evl(tmp_path / f"{label}_fit.evl", times, fit).as_posix(),
+        "dive_u99_evl": _write_flat_evl(tmp_path / f"{label}_u99.evl", times, fit - half_band).as_posix(),
+        "dive_l99_evl": _write_flat_evl(tmp_path / f"{label}_l99.evl", times, fit + half_band).as_posix(),
+    }
+
+
+def test_lines_are_read_from_the_window_when_the_dataset_has_none(tmp_path):
+    """Same answer whether the lines ride in on ds or come from the files."""
+    with_lines = _ds()
+    without = _ds(with_lines=False)
+    t0 = pd.Timestamp(without["ping_time"].values[0])
+    t1 = pd.Timestamp(without["ping_time"].values[-1])
+    window = _window_with_lines(tmp_path, without, "SWD_files", t0, t1, 300.0, 120.0)
+
+    a = dive_profiles.generate_sv_codes(with_lines, [_window(with_lines, "SWD_files")], tmp_path / "a")
+    b = dive_profiles.generate_sv_codes(without, [window], tmp_path / "b")
+
+    pd.testing.assert_frame_equal(
+        pd.read_csv(a["code_csv_paths"][0]), pd.read_csv(b["code_csv_paths"][0])
+    )
+
+
+def test_overlapping_dives_each_get_their_own_lines(tmp_path):
+    """Two dives sharing minutes are coded over their full windows, separately.
+
+    This is HB1603: four of the 13 dives overlap another in time. The combined
+    dataset holds each cell once and carries no dive line, and each dive reads
+    its own lines onto its own slice. The two bands differ, so the coded depths
+    show which dive's line was used.
+    """
+    ds = _ds(n_pings=12, with_lines=False, start="2016-07-25T21:20:00")
+    t = ds["ping_time"].values
+    dive_a = _window_with_lines(tmp_path, ds, "SWD_A", t[0], t[6], 300.0, 120.0)
+    dive_b = _window_with_lines(tmp_path, ds, "SWD_B", t[3], t[11], 200.0, 120.0)
+
+    out = dive_profiles.generate_sv_codes(ds, [dive_a, dive_b], tmp_path / "codes")
+
+    assert out["dive_labels"] == ["SWD_A", "SWD_B"]
+    frame_a = pd.read_csv(out["code_csv_paths"][0])
+    frame_b = pd.read_csv(out["code_csv_paths"][1])
+    assert sorted(frame_a["depth_m"].unique()) == [200.0, 300.0, 400.0]
+    assert sorted(frame_b["depth_m"].unique()) == [100.0, 200.0, 300.0]
+    # Each dive covers its whole window, overlap included, in the summary.
+    summary = pd.read_csv(out["summary_csv_path"])
+    assert (summary["label"] == "SWD_A").sum() == 7
+    assert (summary["label"] == "SWD_B").sum() == 9
+
+
+def test_a_window_without_a_line_file_is_still_an_error(tmp_path):
+    ds = _ds(with_lines=False)
+    with pytest.raises(KeyError, match="names no file under 'dive_fit_evl'"):
+        dive_profiles.generate_sv_codes(ds, [_window(ds)], tmp_path)
