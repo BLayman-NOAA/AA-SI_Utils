@@ -295,8 +295,9 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
                            end: str | None = None,
                            window: Mapping | None = None,
                            allow_empty: bool = False,
-                           dim: str = "ping_time") -> xr.Dataset | None:
-    """Narrow a Dataset to a ping_time window.
+                           dim: str = "ping_time",
+                           windows: list | None = None) -> xr.Dataset | None:
+    """Narrow a Dataset to a ping_time window, or to the union of several.
 
     The user-facing entry point into a survey-wide Sv store.  A survey-level
     recipe computes and checkpoints Sv once for the whole cruise; a user
@@ -338,6 +339,14 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
         window: Mapping supplying ``start`` and ``end`` instead of passing them
             directly, plus an optional ``label`` printed to identify the
             instance.  Mutually exclusive with *start* and *end*.
+        windows: Several such mappings.  Keeps every ping inside at least one
+            of them, in time order, each ping once even where windows overlap.
+            This is the form a step mapped over per-file Sv needs to pull a
+            whole set of dive windows out of each file in one pass: the
+            instance sees one file and cannot loop over the list itself.
+            Mutually exclusive with the three arguments above.  Empty windows
+            are skipped silently; only the whole set selecting nothing is
+            reported, through *allow_empty*.
 
     Returns:
         xr.Dataset: The ``ping_time`` slice of *ds_Sv*.  Returned lazily when
@@ -348,8 +357,18 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
         ValueError: If *window* is combined with *start* or *end*, if it
             carries neither bound, if the window selects no pings and
             *allow_empty* is False, or if
-            *start* is after *end*.
+            *start* is after *end*.  Also if *windows* is combined with any of
+            the single-window arguments, or is empty.
     """
+    if windows is not None and len(windows) == 0:
+        windows = None
+    if windows is not None:
+        if window is not None or start is not None or end is not None:
+            raise ValueError(
+                "pass windows alone, not alongside window or start/end"
+            )
+        return _select_union_of_windows(ds_Sv, windows, allow_empty, dim)
+
     if window is not None:
         if start is not None or end is not None:
             raise ValueError(
@@ -401,6 +420,80 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
         f"{windowed[dim].values[0]} to {windowed[dim].values[-1]}"
     )
     return windowed
+
+
+def _select_union_of_windows(ds_Sv, windows, allow_empty, dim):
+    """Keep every ping of *ds_Sv* inside at least one of *windows*.
+
+    Slices are taken lazily and concatenated, then pings selected by two
+    overlapping windows are kept once and the result is put back in time
+    order.  Nothing is printed per window, since a survey-wide fan-out calls
+    this once per file and most windows miss most files.
+    """
+    if not isinstance(windows, (list, tuple)) or not windows:
+        raise ValueError(
+            "windows must be a non-empty list of mappings with 'start' and "
+            f"'end' keys, got {windows!r}"
+        )
+    if dim not in ds_Sv.dims:
+        raise ValueError(
+            f"dataset has no {dim!r} dimension; dims present: {sorted(ds_Sv.dims)}"
+        )
+
+    pieces = []
+    for entry in windows:
+        if not isinstance(entry, Mapping):
+            raise TypeError(
+                "each window must be a mapping with 'start' and 'end' keys, "
+                f"got {type(entry).__name__}"
+            )
+        w_start, w_end = entry.get("start"), entry.get("end")
+        if w_start is None and w_end is None:
+            raise ValueError(
+                "a window has neither a 'start' nor an 'end' key; keys "
+                f"present: {sorted(entry)}"
+            )
+        if w_start is not None and w_end is not None:
+            if pd.Timestamp(w_start) > pd.Timestamp(w_end):
+                raise ValueError(
+                    f"start {w_start!r} is after end {w_end!r}; the window is empty"
+                )
+        piece = ds_Sv.sel({dim: slice(w_start, w_end)})
+        if piece.sizes.get(dim, 0):
+            pieces.append(piece)
+
+    n_before = ds_Sv.sizes.get(dim, 0)
+    if not pieces:
+        if allow_empty:
+            return None
+        available = ds_Sv[dim].values
+        raise ValueError(
+            f"none of the {len(windows)} windows selects any pings; the "
+            f"dataset spans {available[0]} to {available[-1]}"
+        )
+
+    if len(pieces) == 1:
+        joined = pieces[0]
+    else:
+        joined = xr.concat(
+            pieces, dim=dim, data_vars="minimal", coords="minimal",
+            compat="override", join="override",
+        )
+        index = joined.indexes[dim]
+        if index.has_duplicates:
+            joined = joined.isel({dim: np.flatnonzero(~index.duplicated(keep="first"))})
+        if not joined.indexes[dim].is_monotonic_increasing:
+            joined = joined.sortby(dim)
+
+    n_after = joined.sizes[dim]
+    print(
+        f"select_ping_time_range: {len(pieces)} of {len(windows)} windows "
+        f"touch this dataset; {n_before} -> {n_after} "
+        f"{'pings' if dim == 'ping_time' else dim} "
+        f"({100 * n_after / n_before:.1f}%), "
+        f"{joined[dim].values[0]} to {joined[dim].values[-1]}"
+    )
+    return joined
 
 
 def rechunk_dataset(ds_Sv: xr.Dataset, ping_time_chunk: int) -> xr.Dataset:

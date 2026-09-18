@@ -245,3 +245,64 @@ def test_a_missing_dim_is_an_error_not_a_silent_pass_through():
         utils.select_ping_time_range(
             ds, start="2016-06-27T00:00:00", end="2016-06-27T00:00:20"
         )
+
+
+# ---------------------------------------------------------------------------
+# windows: the union of several windows in one call
+# ---------------------------------------------------------------------------
+
+
+def _w(start_s, end_s, label=None):
+    w = {"start": f"2024-10-15T00:00:{start_s:02d}", "end": f"2024-10-15T00:00:{end_s:02d}"}
+    if label:
+        w["label"] = label
+    return w
+
+
+def test_union_of_windows_keeps_pings_from_each_in_time_order():
+    ds = _make_ds_sv(n_pings=100)
+    out = utils.select_ping_time_range(ds, windows=[_w(40, 44), _w(10, 12)])
+    seconds = out["ping_time"].values.astype("datetime64[s]").astype(int) % 60
+    assert list(seconds) == [10, 11, 12, 40, 41, 42, 43, 44]
+
+
+def test_union_of_overlapping_windows_keeps_each_ping_once():
+    ds = _make_ds_sv(n_pings=100)
+    out = utils.select_ping_time_range(ds, windows=[_w(10, 20), _w(15, 25)])
+    assert out.sizes["ping_time"] == 16
+    assert not out.indexes["ping_time"].has_duplicates
+    assert out.indexes["ping_time"].is_monotonic_increasing
+
+
+def test_union_skips_windows_that_miss_and_returns_none_when_all_miss():
+    ds = _make_ds_sv(n_pings=30)
+    out = utils.select_ping_time_range(ds, windows=[_w(50, 55), _w(5, 6)])
+    assert out.sizes["ping_time"] == 2
+    assert utils.select_ping_time_range(ds, windows=[_w(50, 55)], allow_empty=True) is None
+    with pytest.raises(ValueError, match="none of the 1 windows"):
+        utils.select_ping_time_range(ds, windows=[_w(50, 55)])
+
+
+def test_union_of_windows_is_lazy_on_dask_input():
+    dask = pytest.importorskip("dask")
+    ds = _make_ds_sv(n_pings=100).chunk({"ping_time": 25})
+    out = utils.select_ping_time_range(ds, windows=[_w(10, 12), _w(40, 42)])
+    assert dask.is_dask_collection(out["Sv"].data)
+    assert out.sizes["ping_time"] == 6
+
+
+def test_windows_is_exclusive_with_the_single_window_forms():
+    ds = _make_ds_sv(n_pings=30)
+    with pytest.raises(ValueError, match="windows alone"):
+        utils.select_ping_time_range(ds, windows=[_w(1, 2)], window=_w(3, 4))
+    with pytest.raises(ValueError, match="windows alone"):
+        utils.select_ping_time_range(ds, windows=[_w(1, 2)], start="2024-10-15T00:00:03")
+
+
+def test_empty_windows_list_means_not_given():
+    """The op spec defaults windows to [], which must not shadow start/end."""
+    ds = _make_ds_sv(n_pings=30)
+    out = utils.select_ping_time_range(
+        ds, windows=[], start="2024-10-15T00:00:03", end="2024-10-15T00:00:05"
+    )
+    assert out.sizes["ping_time"] == 3
