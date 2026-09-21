@@ -306,3 +306,63 @@ def test_empty_windows_list_means_not_given():
         ds, windows=[], start="2024-10-15T00:00:03", end="2024-10-15T00:00:05"
     )
     assert out.sizes["ping_time"] == 3
+
+
+# ---------------------------------------------------------------------------
+# snap_to_bin: widening a window to whole bins ahead of time binning
+# ---------------------------------------------------------------------------
+
+
+def test_snap_to_bin_widens_both_ends_to_whole_bins():
+    ds = _make_ds_sv(n_pings=100)
+    out = utils.select_ping_time_range(
+        ds, start="2024-10-15T00:00:13", end="2024-10-15T00:00:32", snap_to_bin="10s"
+    )
+    assert str(out["ping_time"].values[0]).startswith("2024-10-15T00:00:10")
+    assert str(out["ping_time"].values[-1]).startswith("2024-10-15T00:00:39")
+
+
+def test_snap_to_bin_leaves_out_the_next_bins_left_edge():
+    ds = _make_ds_sv(n_pings=100)
+    out = utils.select_ping_time_range(
+        ds, start="2024-10-15T00:00:10", end="2024-10-15T00:00:30", snap_to_bin="10s"
+    )
+    # An end on a bin edge belongs to the bin that starts there.
+    assert out.sizes["ping_time"] == 30
+    assert str(out["ping_time"].values[-1]).startswith("2024-10-15T00:00:39")
+
+
+def test_snap_to_bin_keeps_a_bin_the_exact_window_would_leave_empty():
+    """Pings every 4 s: a window ending 1 s into a bin holds none of its pings."""
+    ds = _make_ds_sv(n_pings=100).isel(ping_time=slice(2, None, 4))
+    bounds = dict(start="2024-10-15T00:00:20", end="2024-10-15T00:00:41")
+
+    exact = utils.select_ping_time_range(ds, **bounds)
+    snapped = utils.select_ping_time_range(ds, snap_to_bin="10s", **bounds)
+
+    def last_bin(out):
+        return out["ping_time"].to_index().floor("10s")[-1].second
+
+    assert last_bin(exact) == 30
+    assert last_bin(snapped) == 40
+
+
+def test_snap_to_bin_applies_to_every_window_of_a_union():
+    ds = _make_ds_sv(n_pings=100)
+    out = utils.select_ping_time_range(
+        ds,
+        windows=[
+            {"start": "2024-10-15T00:00:13", "end": "2024-10-15T00:00:17"},
+            {"start": "2024-10-15T00:00:55", "end": "2024-10-15T00:01:02"},
+        ],
+        snap_to_bin="10s",
+    )
+    seconds = out["ping_time"].to_index()
+    assert out.sizes["ping_time"] == 10 + 20
+    assert str(seconds[0].time()) == "00:00:10" and str(seconds[-1].time()) == "00:01:09"
+
+
+def test_snap_to_bin_none_changes_nothing():
+    ds = _make_ds_sv(n_pings=100)
+    bounds = dict(start="2024-10-15T00:00:13", end="2024-10-15T00:00:32")
+    assert utils.select_ping_time_range(ds, **bounds).sizes["ping_time"] == 20

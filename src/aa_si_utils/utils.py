@@ -296,7 +296,8 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
                            window: Mapping | None = None,
                            allow_empty: bool = False,
                            dim: str = "ping_time",
-                           windows: list | None = None) -> xr.Dataset | None:
+                           windows: list | None = None,
+                           snap_to_bin: str | None = None) -> xr.Dataset | None:
     """Narrow a Dataset to a ping_time window, or to the union of several.
 
     The user-facing entry point into a survey-wide Sv store.  A survey-level
@@ -347,6 +348,14 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
             Mutually exclusive with the three arguments above.  Empty windows
             are skipped silently; only the whole set selecting nothing is
             reported, through *allow_empty*.
+        snap_to_bin: Bin width such as ``"10s"``.  Each window is widened
+            outward to whole bins of that width before selecting: the start
+            moves back to its bin's left edge and the end forward to the last
+            instant of its bin.  Use it when the selection feeds a time
+            binning step, so the first and last bins are averaged over all of
+            their pings and a window ending just inside a bin cannot leave it
+            empty.  Edges are aligned to the epoch, as ``compute_mvbs`` aligns
+            them for any width that divides a day.
 
     Returns:
         xr.Dataset: The ``ping_time`` slice of *ds_Sv*.  Returned lazily when
@@ -367,7 +376,7 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
             raise ValueError(
                 "pass windows alone, not alongside window or start/end"
             )
-        return _select_union_of_windows(ds_Sv, windows, allow_empty, dim)
+        return _select_union_of_windows(ds_Sv, windows, allow_empty, dim, snap_to_bin)
 
     if window is not None:
         if start is not None or end is not None:
@@ -397,6 +406,7 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
             raise ValueError(
                 f"start {start!r} is after end {end!r}; the window is empty"
             )
+    start, end = _snap_bounds_to_bin(start, end, snap_to_bin)
 
     if dim not in ds_Sv.dims:
         raise ValueError(
@@ -422,7 +432,32 @@ def select_ping_time_range(ds_Sv: xr.Dataset,
     return windowed
 
 
-def _select_union_of_windows(ds_Sv, windows, allow_empty, dim):
+def _snap_bounds_to_bin(start, end, snap_to_bin):
+    """Widen a window outward to whole bins of width *snap_to_bin*.
+
+    The end lands one nanosecond short of the next bin's left edge, because the
+    selection is inclusive and a ping on that edge belongs to the next bin.
+
+    Args:
+        start (str | None): Lower bound, or None for open.
+        end (str | None): Upper bound, or None for open.
+        snap_to_bin (str | None): Bin width such as "10s". None returns the
+            bounds unchanged.
+
+    Returns:
+        tuple: The widened ``(start, end)``.
+    """
+    if snap_to_bin is None:
+        return start, end
+    width = pd.Timedelta(snap_to_bin)
+    if start is not None:
+        start = pd.Timestamp(start).floor(width)
+    if end is not None:
+        end = pd.Timestamp(end).floor(width) + width - pd.Timedelta(1, "ns")
+    return start, end
+
+
+def _select_union_of_windows(ds_Sv, windows, allow_empty, dim, snap_to_bin=None):
     """Keep every ping of *ds_Sv* inside at least one of *windows*.
 
     Slices are taken lazily and concatenated, then pings selected by two
@@ -458,6 +493,7 @@ def _select_union_of_windows(ds_Sv, windows, allow_empty, dim):
                 raise ValueError(
                     f"start {w_start!r} is after end {w_end!r}; the window is empty"
                 )
+        w_start, w_end = _snap_bounds_to_bin(w_start, w_end, snap_to_bin)
         piece = ds_Sv.sel({dim: slice(w_start, w_end)})
         if piece.sizes.get(dim, 0):
             pieces.append(piece)
