@@ -335,3 +335,22 @@ def test_include_labels_selects_the_smoke_test_dive():
     # The three files the smoke-test survey slice covers.
     assert len(out["raw_files"]) == 3
     assert window["start"].startswith("2016-07-07T19:48")
+
+
+# ---------------------------------------------------------------------------
+# _bin_seconds: the grid's ping-time bin in the spelling compute_mvbs takes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, seconds",
+    [("10s", 10.0), ("10S", 10.0), ("5s", 5.0), ("1min", 60.0), (10, 10.0), (2.5, 2.5)],
+)
+def test_bin_seconds_reads_offset_strings_and_numbers(value, seconds):
+    assert dive_profiles._bin_seconds(value) == seconds
+
+
+@pytest.mark.parametrize("value", ["ten seconds", "0s", -3, True, ""])
+def test_bin_seconds_rejects_what_is_not_a_positive_duration(value):
+    with pytest.raises(ValueError):
+        dive_profiles._bin_seconds(value)

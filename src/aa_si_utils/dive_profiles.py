@@ -69,6 +69,7 @@ def generate_sv_codes(
     ping_time_bin_s=10.0,
     include_noise=True,
     frequencies_khz=None,
+    ping_time_bin=None,
 ):
     """Write per-dive SVCode CSVs from an embedded clustering result.
 
@@ -108,11 +109,17 @@ def generate_sv_codes(
         upper_var (str): Upper (shallower) confidence bound variable.
         lower_var (str): Lower (deeper) confidence bound variable.
         ping_time_bin_s (float): Seconds one ping bin represents, used to turn a
-            ping count into a duration. Should match compute_mvbs's
-            ping_time_bin.
+            ping count into a duration. Must match compute_mvbs's
+            ping_time_bin; prefer *ping_time_bin* below, which takes that
+            setting in its own spelling.
         include_noise (bool): Keep cells HDBSCAN labelled noise (-1) as their own
             code. True by default, so the per-code durations account for the
             whole dive rather than silently dropping the unclustered part.
+        ping_time_bin (str | float | None): The grid's ping-time bin as
+            compute_mvbs takes it, for example ``"10s"``, or a number of
+            seconds. When given it overrides *ping_time_bin_s*, so a recipe can
+            wire the one value it grids on and the durations cannot drift from
+            it.
         frequencies_khz (list[float] | None): Frequencies in kHz to write as Sv
             columns, overriding each window's own ``frequencies_khz``. None uses
             the window's list, and falls back to every channel carrying data.
@@ -128,6 +135,8 @@ def generate_sv_codes(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if ping_time_bin is not None:
+        ping_time_bin_s = _bin_seconds(ping_time_bin)
 
     label_grid_var = label_grid_var or f"{dataset_name}_{ml_result_name}_grid"
     if label_grid_var not in ds:
@@ -191,6 +200,36 @@ def generate_sv_codes(
         "summary_csv_path": summary_path.as_posix(),
         "dive_labels": labels_written,
     }
+
+
+def _bin_seconds(value):
+    """Seconds in a ping-time bin given as a number or a pandas offset string.
+
+    Args:
+        value (str | float | int): ``"10s"``, ``"1min"``, or seconds.
+
+    Returns:
+        float: The bin length in seconds.
+
+    Raises:
+        ValueError: If the value cannot be read as a duration or is not
+            positive.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"ping_time_bin must be a duration, got {value!r}")
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        try:
+            seconds = pd.Timedelta(str(value)).total_seconds()
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"ping_time_bin {value!r} is not a duration pandas can parse, "
+                f"such as '10s'"
+            ) from exc
+    if not seconds > 0:
+        raise ValueError(f"ping_time_bin must be positive, got {value!r}")
+    return seconds
 
 
 def _attach_dive_lines(ds, window, line_keys):

@@ -8,6 +8,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `aa_si_utils.seabed`, a phase-aware dynamic-programming seabed detector
+  implementing the Mode 1 core path of the v4 design (Stages 0, 2b, 3, 4, 5,
+  5c, 6 and 8). `detect_seafloor_phase` is the recipe entry point and returns
+  the seabed echo's leading edge as the same 1-D `(ping_time,)` line in
+  metres the other seafloor ops return, surface-referenced when `ds_Sv`
+  carries `depth`; `detect_seabed` returns every intermediate (seed and alias
+  masks, features f1 to f6, score, candidates, raw pick, leading edge,
+  Ona-Mitson integration line, confidence, margin, flags) as a Dataset.
+  Windows are given in metres, pulse lengths and seconds and converted from
+  the file's own `tau_effective`, `echo_range`, ping times and position.
+  Two departures from the design, both forced by HB1603 38 kHz data at
+  1750 m: phase activity is the variance of the physical angles within the
+  window rather than their mean square, because the seabed centroid sat
+  2 degrees off axis and the mean square could not separate it from water;
+  and the f2/f5 references are the seed medians, as f1's already is. The
+  Blackwell alias detector is implemented but off by default, since on that
+  file (8 s pinging, no aliasing possible) its mask covered the true seabed.
+  Without split-beam angles the detector runs amplitude-only and warns.
+  `aa_si_utils.seabed.prior.estimate_prior` implements Mode 0 (0a regular
+  and 0b adaptive slab sampling): a few dozen slabs of pings, averaged and
+  binned to two pulse lengths, scored with the reduced score and joined by
+  the same line search, with bisection of gaps whose picks disagree by more
+  than the break-point. Its line and uncertainty become the per-ping search
+  window, so `detect_seafloor_phase` with no window, prior or line file is
+  self-contained (`prior="auto"`, the default; `prior="none"` keeps the
+  fixed window). Geometry now reads only the first sample of every ping and
+  the first ping's row, so a whole-survey dataset costs no more than one
+  file to set up.
+  `line="integration"` returns the slope-corrected Ona-Mitson backstep
+  instead of the leading edge; on the HB1603 canyon walls a 10 m buffer
+  above the leading edge still left up-slope echo in the 18 kHz channel.
+  `mode=2` adds the Stage 3b shape features (below-above Sv contrast,
+  below-region Sv std, below-region phase activity) over the preset's shape
+  window; on HB1603 it moved the edge 3 m further up the rise and cut the
+  flagged pings from 31 % to 27 %, on HB2407 it changed nothing.
+- `scripts/validate_seabed_detection.py` and `aa_si_utils.seabed.validation`:
+  run the detector on one raw file against its .bot pick or an Echoview line
+  and write the design's agreement metrics, an echogram overlay and the
+  diagnostics. The references are not ground truth: on HB1603 the .bot line
+  sits about 8 m below the Sv rise, on HB2407 the Echoview line 2 m above
+  it, and the overlay is what decides which side is right.
+- `aa_si_utils.seabed.compare` and `scripts/compare_seabed_methods.py`: an
+  inter-method comparison of seafloor detectors (the .bot pick, Echoview
+  lines, a max-Sv baseline, echopype basic and Blackwell, the experimental
+  HDBSCAN detector, and the phase detector in Mode 1, Mode 2, amplitude-only,
+  integration-line and secondary-channel variants) on six two-hour datasets
+  from HB1603 and HB2407. Reports detector time, reference-free sanity checks
+  (contrast across the line, echo intensity below it, lines left in water,
+  ping-to-ping jumps) and pairwise plus consensus agreement, with one line
+  per method family voting so the phase variants cannot outvote the rest.
+  `scripts/report_seabed_comparison.py` turns the result folders into a
+  markdown report with overlays.
+- `slow` pytest marker for `tests/test_seabed_real_files.py`, which skips
+  when the HB1603 and HB2407 example files are absent.
+- `scipy` is now a dependency (`ndimage` filters and connected components).
 - `build_range_grid`, producing the uniformly spaced range grid that
   `echopype.commongrid.resample_to_geometry` takes as its `target_grid`. That
   function wants a DataArray rather than a number, which a recipe params block

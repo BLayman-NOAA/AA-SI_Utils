@@ -202,6 +202,7 @@ def filter_paths_by_file_time(
 # Echoview seabed-line helpers
 
 _EVL_NAME_RE = re.compile(r"d(\d{8})_t(\d{6})-t(\d{6})")
+_RAW_STAMP_RE = re.compile(r"D(\d{8})-T(\d{6})")
 
 
 def parse_evl_span_from_filename(filename):
@@ -735,6 +736,7 @@ def query_ncei_data(
     radius_nm=None,
     filters=None,
     return_geometry=True,
+    file_names=None,
 ):
     """Query the NOAA NCEI Water Column Sonar Data (WCSD) archive.
 
@@ -788,6 +790,13 @@ def query_ncei_data(
             records / checkpoints smaller. Geometry is always returned for
             spatial queries (``bbox`` or ``center_point``) regardless of this
             flag.
+        file_names (list[str] | None): Keep only these files, matched on the
+            ``D{date}-T{time}`` stamp in the name, so ``D20160725-T205832.raw``
+            finds the archive's ``HB1603_L1-D20160725-T205832.tar`` and the
+            reverse. Applied after the time window, client side, in catalogue
+            order. A name with no stamp, or one the query did not return,
+            raises rather than silently shrinking the result. ``None`` or
+            empty keeps everything.
 
     Returns:
         dict: A dict with two keys:
@@ -920,6 +929,9 @@ def query_ncei_data(
             f"({file_time_start} to {file_time_end})"
         )
 
+    if file_names:
+        items = _keep_named_files(items, file_names)
+
     # Sort by filename time and limit
     items_with_time = [i for i in items if i.get("FILE_DATETIME")]
     items_without_time = [i for i in items if not i.get("FILE_DATETIME")]
@@ -942,6 +954,46 @@ def query_ncei_data(
         "query_label": query_label,
         "raw_urls": ncei_raw_urls(items),
     }
+
+
+def _keep_named_files(items, file_names):
+    """Keep the records whose file the caller named, by stamp.
+
+    Args:
+        items (list[dict]): Query records carrying ``FILE_NAME``.
+        file_names (list[str]): Names to keep; only the stamp is compared.
+
+    Returns:
+        list[dict]: The matching records, in the order *items* had them.
+
+    Raises:
+        ValueError: If a name carries no stamp, or matches no record.
+    """
+    wanted = {}
+    for name in file_names:
+        match = _RAW_STAMP_RE.search(str(name))
+        if match is None:
+            raise ValueError(
+                f"file_names entry {name!r} carries no D{{date}}-T{{time}} stamp"
+            )
+        wanted[match.group(0)] = str(name)
+
+    kept = []
+    seen = set()
+    for item in items:
+        match = _RAW_STAMP_RE.search(str(item.get("FILE_NAME") or ""))
+        if match is not None and match.group(0) in wanted:
+            kept.append(item)
+            seen.add(match.group(0))
+
+    missing = sorted(wanted[s] for s in wanted if s not in seen)
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(wanted)} named file(s) are not in the query "
+            f"result, e.g. {missing[:3]}; widen the time window or check the names"
+        )
+    print(f"  File-name filter: {len(items)} -> {len(kept)} results ({len(wanted)} name(s))")
+    return kept
 
 
 def download_ncei_data(

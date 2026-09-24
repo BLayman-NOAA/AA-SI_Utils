@@ -363,3 +363,68 @@ def test_download_skips_existing_tar_extraction(monkeypatch, tmp_path):
     assert call_count["n"] == 0
     assert out2["download_dir"] == (tmp_path / "tarq").as_posix()
     assert any(Path(p).name == "inner.raw" for p in out2["downloaded_paths"])
+
+
+# ---------------------------------------------------------------------------
+# file_names: keep only the named files
+# ---------------------------------------------------------------------------
+
+
+def _catalogue():
+    return [
+        _make_record("HB1603_L1-D20160707-T192446.raw"),
+        _make_record("HB1603_L1-D20160707-T194743.raw"),
+        _make_record("D20160725-T205832.raw"),
+        _make_record("D20160725-T212129.raw"),
+    ]
+
+
+def test_file_names_keeps_named_files_in_catalogue_order_matching_either_form(monkeypatch):
+    monkeypatch.setattr(dr, "_fetch_all_pages", lambda params: _catalogue())
+
+    result = dr.query_ncei_data(
+        file_time_start="2016-07-01",
+        file_time_end="2016-08-01",
+        file_names=["D20160725-T212129.tar", "D20160707-T192446.raw"],
+    )
+
+    names = [r["FILE_NAME"] for r in result["records"]]
+    assert names == ["HB1603_L1-D20160707-T192446.raw", "D20160725-T212129.raw"]
+    assert [u.rsplit("/", 1)[-1] for u in result["raw_urls"]] == names
+
+
+def test_file_names_raises_when_a_named_file_is_missing(monkeypatch):
+    monkeypatch.setattr(dr, "_fetch_all_pages", lambda params: _catalogue())
+
+    with pytest.raises(ValueError, match="1 of 2 named file"):
+        dr.query_ncei_data(
+            file_time_start="2016-07-01",
+            file_names=["D20160725-T212129.raw", "D20160801-T000000.raw"],
+        )
+
+
+def test_file_names_rejects_a_name_without_a_stamp(monkeypatch):
+    monkeypatch.setattr(dr, "_fetch_all_pages", lambda params: _catalogue())
+
+    with pytest.raises(ValueError, match="no D"):
+        dr.query_ncei_data(file_time_start="2016-07-01", file_names=["notes.raw"])
+
+
+def test_empty_file_names_keeps_everything(monkeypatch):
+    monkeypatch.setattr(dr, "_fetch_all_pages", lambda params: _catalogue())
+
+    result = dr.query_ncei_data(file_time_start="2016-07-01", file_names=[])
+
+    assert len(result["records"]) == 4
+
+
+def test_file_names_applies_after_the_time_window(monkeypatch):
+    """A named file outside the window is a miss, not a way around the window."""
+    monkeypatch.setattr(dr, "_fetch_all_pages", lambda params: _catalogue())
+
+    with pytest.raises(ValueError, match="not in the query result"):
+        dr.query_ncei_data(
+            file_time_start="2016-07-20",
+            file_time_end="2016-08-01",
+            file_names=["D20160707-T192446.raw"],
+        )
