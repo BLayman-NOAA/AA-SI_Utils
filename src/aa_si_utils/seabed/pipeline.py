@@ -15,7 +15,7 @@ import xarray as xr
 
 from aa_si_utils.seabed.dp import run_dp, select_candidates, transition_params
 from aa_si_utils.seabed.features import background_estimate, point_features, shape_features
-from aa_si_utils.seabed.geometry import build_geometry, crop_block
+from aa_si_utils.seabed.geometry import build_geometry, crop_block, resolve_channel
 from aa_si_utils.seabed.phase import alias_candidates, seed_mask
 from aa_si_utils.seabed.prior import estimate_prior
 from aa_si_utils.seabed.refine import backstep, leading_edge
@@ -32,6 +32,42 @@ _COVERAGE_WARNING = (
     "seafloor is NaN. Widen max_gap_s, lower min_score, or check the search "
     "window against the seabed depth."
 )
+
+
+# Variables the detector reads. Anything else on the dataset is left behind.
+_NEEDED_VARS = (
+    "Sv",
+    "depth",
+    "echo_range",
+    "angle_alongship",
+    "angle_athwartship",
+    "latitude",
+    "longitude",
+    "frequency_nominal",
+    "tau_effective",
+    "sound_speed",
+    "sound_absorption",
+    "beamwidth_alongship",
+    "beamwidth_athwartship",
+)
+
+
+def _materialize(ds_Sv, channel):
+    """The variables the detector reads, loaded into memory once.
+
+    In a recipe ds_Sv usually arrives as an unevaluated chain (calibration,
+    depth, split-beam angles, crop). Every slab the prior reads and every
+    block the detector crops would otherwise re-run that chain. Only the
+    needed variables are kept, and only the requested channel when one is
+    given, so a per-file dataset costs tens of megabytes.
+    """
+    names = [v for v in _NEEDED_VARS if v in ds_Sv]
+    sub = ds_Sv[names]
+    if channel is not None:
+        sub = sub.isel(channel=[resolve_channel(ds_Sv, channel)])
+    if any(sub[v].chunks is not None for v in sub.data_vars):
+        sub = sub.load()
+    return sub
 
 
 def _channels_by_frequency(ds_Sv):
@@ -163,6 +199,7 @@ def detect_seabed(
         and integration lines, confidence, margin and per-ping flags on the
         cropped ``(ping_time, range_sample)`` grid, with run attributes.
     """
+    ds_Sv = _materialize(ds_Sv, channel)
     prior_attrs = {"prior": "none" if z_prior is None else "given"}
     if z_prior is None and prior == "auto":
         prior_channel = channel if channel is not None else _channels_by_frequency(ds_Sv)[0]

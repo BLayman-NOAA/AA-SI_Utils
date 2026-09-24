@@ -173,3 +173,19 @@ def test_integration_line_option_returns_the_backstep():
     assert np.all(edge.values - integration.values < 5.0)
     with pytest.raises(ValueError, match="line must be"):
         detect_seafloor_phase(ds, r_min=50.0, r_max=150.0, line="raw")
+
+
+def test_lazy_input_is_loaded_once_for_the_chosen_channel():
+    from aa_si_utils.seabed.pipeline import _materialize
+
+    ds, _ = make_synthetic_sv(n_ping=20, seabed_depth_m=100.0, frequencies_hz=(18000, 38000))
+    lazy = ds.chunk({"ping_time": 5})
+    lazy["unused"] = lazy["Sv"] * 2
+
+    sub = _materialize(lazy, 38)
+
+    assert sub.sizes["channel"] == 1
+    assert str(sub["channel"].values[0]) == "38000"
+    assert "unused" not in sub
+    assert all(sub[v].chunks is None for v in sub.data_vars)
+    assert _materialize(ds, None).sizes["channel"] == 2
