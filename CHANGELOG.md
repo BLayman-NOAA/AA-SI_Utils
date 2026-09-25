@@ -36,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed window). Geometry now reads only the first sample of every ping and
   the first ping's row, so a whole-survey dataset costs no more than one
   file to set up.
+  A pick whose mean Sv over the pulse length below it is under
+  `min_seabed_sv_db` (default -50 dB) is rejected, in the prior's slabs and
+  in the final line: the scores are relative to each ping, so on the first
+  HB1603 survey run files whose seabed lies beyond the 1800 m crop were
+  given a line on a -57 dB scattering layer at 16 to 23 m, a third of the
+  files finished. Real seabed echoes there run -2 to -40 dB. Pings whose
+  search window is empty (a prior outside the recorded range, or a ping
+  with no valid depth, as on a file with 38 m heave spikes) now get no
+  seabed instead of stopping the run; a file with no window anywhere
+  returns no line.
   `line="integration"` returns the slope-corrected Ona-Mitson backstep
   instead of the leading edge; on the HB1603 canyon walls a 10 m buffer
   above the leading edge still left up-slope echo in the 18 kHz channel.

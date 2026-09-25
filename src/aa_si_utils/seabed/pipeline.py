@@ -15,7 +15,7 @@ import xarray as xr
 
 from aa_si_utils.seabed.dp import run_dp, select_candidates, transition_params
 from aa_si_utils.seabed.features import background_estimate, point_features, shape_features
-from aa_si_utils.seabed.geometry import build_geometry, crop_block, resolve_channel
+from aa_si_utils.seabed.geometry import EmptyWindowError, build_geometry, crop_block, resolve_channel
 from aa_si_utils.seabed.phase import alias_candidates, seed_mask
 from aa_si_utils.seabed.prior import estimate_prior
 from aa_si_utils.seabed.refine import backstep, leading_edge
@@ -26,6 +26,7 @@ FLAG_WALKBACK_BOUND = 2
 FLAG_LOW_CONFIDENCE = 4
 FLAG_LOW_MARGIN = 8
 FLAG_INTERPOLATED = 16
+FLAG_TOO_WEAK = 32
 
 _COVERAGE_WARNING = (
     "  WARNING: create_seafloor_mask drops a ping entirely where the "
@@ -148,6 +149,7 @@ def detect_seabed(
     mode=1,
     prior="auto",
     prior_budget=64,
+    min_seabed_sv_db=-50.0,
 ):
     """Run the Mode 1 or Mode 2 pipeline on one channel and keep every intermediate.
 
@@ -193,6 +195,11 @@ def detect_seabed(
             inside r_min / r_max if those are set; ``"none"`` searches the
             fixed window only.
         prior_budget: Mode 0b slab budget.
+        min_seabed_sv_db: A pick whose mean Sv over the pulse length below
+            it is under this is rejected as not seabed, in the prior's
+            slabs and in the final line. Seabed echoes here run -13 to -40
+            dB; a scattering layer or noise with no seabed in range is far
+            quieter. None disables the check.
 
     Returns:
         xr.Dataset: Masks, features, score, candidates, the raw, refined
@@ -210,6 +217,7 @@ def detect_seabed(
             r_max=r_max,
             budget=prior_budget,
             max_slope_deg=max_slope_deg,
+            min_seabed_sv_db=min_seabed_sv_db,
             vessel_speed_m_s=vessel_speed_m_s,
             pulse_length_s=pulse_length_s,
             beamwidth_deg=beamwidth_deg,
@@ -238,6 +246,14 @@ def detect_seabed(
         beamwidth_deg=beamwidth_deg,
     )
     stage2_args = (regime, geometry_kwargs, detect_aliases, phase_threshold_deg2)
+    if prior_attrs["prior"] == "mode0":
+        # A prior that leaves no window anywhere is worse than none.
+        try:
+            build_geometry(ds_Sv, channel if channel is not None else _channels_by_frequency(ds_Sv)[0], **geometry_kwargs)
+        except EmptyWindowError:
+            warnings.warn("Mode 0 prior left no search window; searching the fixed window")
+            geometry_kwargs.update(z_prior=None, sigma_prior_m=None)
+            prior_attrs = {"prior": "none"}
     if channel is None:
         stage2 = None
         for label in _channels_by_frequency(ds_Sv):
@@ -280,13 +296,26 @@ def detect_seabed(
     loud = np.isfinite(sv) & (sv > seeds.sv_threshold_db - 10.0)
     dp = run_dp(cand, geom, params, tolerance_pulses=confidence_tolerance_pulses, loud=loud)
 
+    too_weak = np.zeros(geom.n_ping, dtype=bool)
+    if min_seabed_sv_db is not None:
+        n_k = geom.pulse_samples
+        for p in np.nonzero(np.isfinite(dp.r_star_idx))[0]:
+            i = int(dp.r_star_idx[p])
+            below = sv[p, i : i + n_k + 1]
+            below = below[np.isfinite(below)]
+            # Mean over the pulse, in linear units, so one noisy sample
+            # cannot carry a pick over the floor.
+            if not below.size or 10.0 * np.log10(np.mean(10.0 ** (below / 10.0))) < min_seabed_sv_db:
+                too_weak[p] = True
+        dp.r_star_idx[too_weak] = np.nan
     le_idx, bound_hit = leading_edge(sv, dp.r_star_idx, geom, walkback_db=walkback_db)
     r_star_m = geom.sample_to_range(dp.r_star_idx + geom.i_lo)
     r_le_m = geom.sample_to_range(le_idx + geom.i_lo)
     r_int_m = backstep(r_le_m, geom, effective_beamwidth_deg=effective_beamwidth_deg)
 
     flags = np.zeros(geom.n_ping, dtype=np.int16)
-    flags[~cand.valid] |= FLAG_SKIPPED
+    flags[~cand.valid | geom.empty] |= FLAG_SKIPPED
+    flags[too_weak] |= FLAG_TOO_WEAK
     flags[bound_hit] |= FLAG_WALKBACK_BOUND
     flags[np.isfinite(dp.confidence) & (dp.confidence < min_confidence)] |= FLAG_LOW_CONFIDENCE
     flags[np.isfinite(dp.margin) & (dp.margin < params.lam * params.delta)] |= FLAG_LOW_MARGIN
@@ -310,7 +339,7 @@ def detect_seabed(
         "margin": (("ping_time",), dp.margin),
         "delta": (("ping_time",), params.delta, {"units": "m"}),
         "range_end_m": (("ping_time",), geom.range0 + (geom.n_valid - 1) * geom.dr, {"units": "m", "long_name": "last recorded range"}),
-        "flags": (("ping_time",), flags, {"bits": "1 skipped, 2 walkback bound, 4 low confidence, 8 low margin, 16 interpolated"}),
+        "flags": (("ping_time",), flags, {"bits": "1 skipped, 2 walkback bound, 4 low confidence, 8 low margin, 16 interpolated, 32 too weak to be seabed"}),
     }
     for name, arr in features.items():
         data[name] = (dims2, arr, feature_attrs[name])
@@ -327,6 +356,8 @@ def detect_seabed(
         "seed_sv_db": float(seeds.sv_threshold_db),
         "detection_range_m": float(seeds.detection_range_m),
         "n_seed_components": int(seeds.n_components),
+        "n_empty_window": int(geom.empty.sum()),
+        "n_too_weak": int(too_weak.sum()),
         "pulse_length_m": geom.pulse_length_m,
         "beamwidth_deg": geom.beamwidth_deg,
         "lambda": float(params.lam),
@@ -359,6 +390,47 @@ def _fill_gaps(values, ping_time, max_gap_s):
     return out, filled
 
 
+def _last_range(ds_Sv, channel):
+    """Deepest finite value of the range variable per ping, in metres."""
+    range_var = "depth" if "depth" in ds_Sv else "echo_range"
+    da = ds_Sv[range_var]
+    if "channel" in da.dims:
+        index = resolve_channel(ds_Sv, channel) if channel is not None else 0
+        da = da.isel(channel=index)
+    da = da.max("range_sample", skipna=True)
+    return np.asarray(da.compute().values if hasattr(da, "compute") else da.values, dtype=float)
+
+
+def _no_window_result(ds_Sv, channel):
+    """What detect_seabed would report for a file with no search window."""
+    n_ping = ds_Sv.sizes["ping_time"]
+    empty = np.full(n_ping, np.nan)
+    diag = xr.Dataset(
+        {
+            "r_le": (("ping_time",), empty),
+            "r_int": (("ping_time",), empty.copy()),
+            "range_end_m": (("ping_time",), _last_range(ds_Sv, channel)),
+            "flags": (("ping_time",), np.full(n_ping, FLAG_SKIPPED, dtype=np.int16)),
+        },
+        coords={"ping_time": ds_Sv["ping_time"]},
+    )
+    label = str(ds_Sv["channel"].values[resolve_channel(ds_Sv, channel)]) if channel is not None else ""
+    diag.attrs.update(
+        primary_channel=label,
+        range_var="depth" if "depth" in ds_Sv else "echo_range",
+        mode=0,
+        prior="none",
+        regime="",
+        preset_version="",
+        has_angles=int("angle_alongship" in ds_Sv),
+        n_seed_components=0,
+        n_empty_window=int(n_ping),
+        window_median_r_min_m=float("nan"),
+        window_median_r_max_m=float("nan"),
+    )
+    return diag
+
+
 def detect_seafloor_phase(
     ds_Sv,
     echodata=None,
@@ -389,6 +461,7 @@ def detect_seafloor_phase(
     line="leading_edge",
     prior="auto",
     prior_budget=64,
+    min_seabed_sv_db=-50.0,
     missing="nan",
     diagnostics_path=None,
 ):
@@ -430,7 +503,8 @@ def detect_seafloor_phase(
     Returns:
         xr.DataArray: ``seafloor_depth`` in metres, dims ``("ping_time",)``.
     """
-    diag = detect_seabed(
+    try:
+        diag = detect_seabed(
         ds_Sv,
         channel=channel,
         r_min=r_min,
@@ -457,7 +531,11 @@ def detect_seafloor_phase(
         mode=mode,
         prior=prior,
         prior_budget=prior_budget,
-    )
+        min_seabed_sv_db=min_seabed_sv_db,
+        )
+    except EmptyWindowError:
+        warnings.warn("no ping has a search window; the file gets no seabed line")
+        diag = _no_window_result(ds_Sv, channel)
     if line not in ("leading_edge", "integration"):
         raise ValueError(f"line must be 'leading_edge' or 'integration', got {line!r}")
     source = "r_le" if line == "leading_edge" else "r_int"

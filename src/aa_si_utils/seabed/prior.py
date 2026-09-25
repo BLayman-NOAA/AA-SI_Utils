@@ -19,7 +19,7 @@ import numpy as np
 import xarray as xr
 
 from aa_si_utils.seabed.dp import Candidates, run_dp, transition_params
-from aa_si_utils.seabed.geometry import build_geometry
+from aa_si_utils.seabed.geometry import EmptyWindowError, build_geometry
 from aa_si_utils.seabed.phase import angle_variance
 
 LINEAR_EPS = 1e-12
@@ -102,9 +102,11 @@ def slab_score(sv_db, f2, beamwidth_deg):
     return score
 
 
-def _slab_candidates(score, bin_range, n_candidates, min_score):
-    """Top-N local maxima of a slab score."""
+def _slab_candidates(score, bin_range, n_candidates, min_score, sv_db=None, min_sv_db=None):
+    """Top-N local maxima of a slab score, optionally only loud enough ones."""
     s = np.where(np.isfinite(score), score, -np.inf)
+    if sv_db is not None and min_sv_db is not None:
+        s = np.where(np.isfinite(sv_db) & (sv_db >= min_sv_db), s, -np.inf)
     left = np.concatenate([[-np.inf], s[:-1]])
     right = np.concatenate([s[1:], [-np.inf]])
     local = (s >= left) & (s >= right) & (s >= min_score) & np.isfinite(s)
@@ -164,6 +166,7 @@ def estimate_prior(
     use_angles=True,
     sigma_fraction=0.05,
     sigma_floor_m=5.0,
+    min_seabed_sv_db=-50.0,
     **geometry_kwargs,
 ):
     """Mode 0 seabed prior from sampled slabs.
@@ -185,6 +188,10 @@ def estimate_prior(
         use_angles: Include the phase term when angles are available.
         sigma_fraction: Floor on the uncertainty as a fraction of depth.
         sigma_floor_m: Absolute floor on the uncertainty in metres.
+        min_seabed_sv_db: A slab bin quieter than this cannot be the seabed,
+            whatever its score; the score is relative to the slab itself, so
+            without it a slab with no seabed in range picks its loudest
+            scattering layer. None disables the floor.
         **geometry_kwargs: ``vessel_speed_m_s``, ``pulse_length_s``,
             ``beamwidth_deg`` for :func:`build_geometry`.
 
@@ -192,7 +199,10 @@ def estimate_prior(
         xr.Dataset or None: ``z_prior`` and ``sigma_prior`` per ping plus
         the slab picks, or None when fewer than two slabs found a seabed.
     """
-    geom = build_geometry(ds_Sv, channel, r_min=r_min, r_max=r_max, **geometry_kwargs)
+    try:
+        geom = build_geometry(ds_Sv, channel, r_min=r_min, r_max=r_max, **geometry_kwargs)
+    except EmptyWindowError:
+        return None
     n_bin = geom.pulse_lengths_to_samples(2.0)
     n_ping = geom.n_ping
     if adaptive:
@@ -208,7 +218,9 @@ def estimate_prior(
         if c not in slabs:
             sv_db, f2, bin_range = slab_profile(ds_Sv, geom, c, slab_pings, n_bin, use_angles)
             score = slab_score(sv_db, f2, geom.beamwidth_deg)
-            idx, sc, rng = _slab_candidates(score, bin_range, n_candidates, min_score)
+            idx, sc, rng = _slab_candidates(
+                score, bin_range, n_candidates, min_score, sv_db=sv_db, min_sv_db=min_seabed_sv_db
+            )
             slabs[c] = {"idx": idx, "score": sc, "range": rng}
 
     for c in centers:

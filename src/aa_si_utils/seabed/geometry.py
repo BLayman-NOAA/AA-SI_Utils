@@ -21,6 +21,10 @@ from aa_si_utils.utils import _resolve_channel_index, haversine_distance
 DEFAULT_R_MIN_OFFSET_M = 10.0
 
 
+class EmptyWindowError(ValueError):
+    """No ping has a search window with any range in it."""
+
+
 @dataclass
 class PingGeometry:
     """Geometry of one channel of an Sv dataset in physical units.
@@ -48,6 +52,9 @@ class PingGeometry:
             exclusive.
         i_lo: Start of the sample crop that contains every search window.
         i_hi: End of that crop, exclusive.
+        empty: Pings with no search window, shape (P,): the window's bounds
+            crossed (a prior outside the recorded range) or the ping has no
+            valid range. They get no candidates and no seabed.
         has_angles: Whether split-beam angles are available on the channel.
         sound_speed: Sound speed used for the pulse length, m/s.
         tau_s: Pulse duration in seconds.
@@ -71,6 +78,7 @@ class PingGeometry:
     i_max: np.ndarray
     i_lo: int
     i_hi: int
+    empty: np.ndarray
     has_angles: bool
     sound_speed: float
     tau_s: float
@@ -313,15 +321,21 @@ def build_geometry(
     # detector handed a prior window that reaches the transducer.
     lo = np.maximum(lo, range0 + (0.0 if r_min is not None else DEFAULT_R_MIN_OFFSET_M))
     hi = np.minimum(hi, valid_end)
-    if np.any(hi <= lo):
-        raise ValueError("search window is empty on at least one ping; check r_min, r_max, z_prior")
+    # NaN bounds (a ping with no valid range) fail this test too.
+    empty = ~(hi > lo)
+    if empty.all():
+        raise EmptyWindowError("search window is empty on every ping; check r_min, r_max, z_prior")
 
-    i_min = np.floor((lo - range0) / dr).astype(int)
-    i_max = np.ceil((hi - range0) / dr).astype(int) + 1
-    i_min = np.clip(i_min, 0, n_valid - 1)
-    i_max = np.clip(i_max, i_min + 1, n_valid)
-    i_lo = int(i_min.min())
-    i_hi = int(i_max.max())
+    i_min = np.zeros(n_ping, dtype=int)
+    i_max = np.zeros(n_ping, dtype=int)
+    ok = ~empty
+    i_min[ok] = np.clip(np.floor((lo[ok] - range0[ok]) / dr).astype(int), 0, n_valid - 1)
+    i_max[ok] = np.clip(np.ceil((hi[ok] - range0[ok]) / dr).astype(int) + 1, i_min[ok] + 1, n_valid)
+    i_lo = int(i_min[ok].min())
+    i_hi = int(i_max[ok].max())
+    # Empty pings get a zero-width window at the crop start.
+    i_min[empty] = i_lo
+    i_max[empty] = i_lo
 
     absorption = _channel_scalar(ds_Sv, "sound_absorption", ci, default=0.0)
 
@@ -348,6 +362,7 @@ def build_geometry(
         i_max=i_max,
         i_lo=i_lo,
         i_hi=i_hi,
+        empty=empty,
         has_angles=has_angles,
         sound_speed=float(sound_speed),
         tau_s=float(tau_s),
