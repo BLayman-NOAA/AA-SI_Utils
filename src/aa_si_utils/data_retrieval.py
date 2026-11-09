@@ -7,6 +7,8 @@ import json
 import os
 import re
 import tarfile
+import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
@@ -26,6 +28,26 @@ _HTTPS_BUCKET_PREFIX = "https://noaa-wcsd-pds.s3.amazonaws.com/"
 # Maximum records per page returned by the ArcGIS MapServer
 _PAGE_SIZE = 1000
 
+# How query_ncei_data uses the archive's own file listing
+_LISTING_MODES = ("auto", "catalog", "bucket")
+
+# Filters that name whole cruises or instruments, so a folder listing can honour
+# them. The first two narrow a query enough to look its folders up undated.
+_CRUISE_SCOPE_FIELDS = {"CRUISE_NAME", "DATASET_NAME"}
+_FOLDER_LEVEL_FIELDS = _CRUISE_SCOPE_FIELDS | {"PLATFORM_NAME", "INSTRUMENT_NAME"}
+
+_S3_XML_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+
+# A listing page is tried this often, doubling the pause, before the query fails.
+_LISTING_ATTEMPTS = 3
+_LISTING_RETRY_SECONDS = 2
+
+_NO_FOLDER_WARNING = (
+    "Warning: NCEI's catalogue names no S3 folder for this query, so the archive's "
+    "own listing could not be checked. If this cruise should have files, the "
+    "catalogue may have lost them all."
+)
+
 
 # Filename-time helpers (public: reused for filtering user-supplied folders)
 
@@ -35,13 +57,16 @@ def parse_datetime_from_filename(filename):
     Matches the ``D{YYYYMMDD}-T{HHMMSS}`` pattern anywhere in the filename,
     e.g. ``D20160725-T205832.tar`` or ``DY2207_EK80-D20220604-T074711.raw``.
 
-    Returns ``None`` when the pattern is not found.
+    Returns ``None`` when the pattern is not found or is not a real date.
     """
     match = re.search(r"D(\d{8})-T(\d{6})", filename)
     if not match:
         return None
     date_part, time_part = match.groups()
-    return datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S")
+    try:
+        return datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
 
 
 # Back-compat alias for internal call sites predating the public promotion.
@@ -570,8 +595,7 @@ def _fetch_all_pages(params):
         data = response.json()
 
         if "error" in data:
-            print("API Error:", data["error"])
-            return []
+            raise requests.exceptions.RequestException(f"API error: {data['error']}")
 
         features = data.get("features", [])
         for feature in features:
@@ -630,6 +654,226 @@ def ncei_raw_urls(records, suffix=".raw"):
         url = _s3_to_https(cloud_path)
         urls.append(url if url.endswith(suffix) else url + suffix)
     return urls
+
+
+# The archive's own file listing
+
+def _archive_key(cloud_path):
+    """A file's S3 path without its ``.raw``, as catalogue records may or may not end."""
+    return cloud_path[:-4] if cloud_path.endswith(".raw") else cloud_path
+
+
+def _archive_folder(cloud_path):
+    """The S3 folder holding a file, with its trailing slash."""
+    return cloud_path.rpartition("/")[0] + "/"
+
+
+def _read_listing_page(params):
+    """One page of a bucket listing, tried again since a failure stops the query."""
+    for attempt in range(_LISTING_ATTEMPTS):
+        try:
+            response = requests.get(_HTTPS_BUCKET_PREFIX, params=params, timeout=120)
+            response.raise_for_status()
+            return ET.fromstring(response.content)
+        except (requests.exceptions.RequestException, ET.ParseError):
+            if attempt == _LISTING_ATTEMPTS - 1:
+                raise
+            time.sleep(_LISTING_RETRY_SECONDS * 2 ** attempt)
+
+
+def _list_bucket_raw_files(folder):
+    """List the raw files directly under an S3 folder of the public WCSD bucket.
+
+    Args:
+        folder (str): The folder as ``s3://noaa-wcsd-pds/.../``.
+
+    Returns:
+        list[str]: Each file's S3 path without its ``.raw``, in key order.
+
+    Raises:
+        requests.exceptions.RequestException: If the bucket cannot be read.
+        xml.etree.ElementTree.ParseError: If its answer is not a listing.
+    """
+    keys = []
+    params = {
+        "list-type": "2",
+        "prefix": folder[len(_S3_BUCKET_PREFIX):],
+        "delimiter": "/",
+    }
+    while True:
+        root = _read_listing_page(params)
+        keys += [key.text for key in root.findall(f"{_S3_XML_NS}Contents/{_S3_XML_NS}Key")]
+        token = root.findtext(f"{_S3_XML_NS}NextContinuationToken")
+        if not token:
+            break
+        params["continuation-token"] = token
+    return [_S3_BUCKET_PREFIX + key[:-4] for key in keys if key.endswith(".raw")]
+
+
+def _catalogued_folders(where_clause):
+    """The S3 folders the catalogue names for a query, whatever their dates.
+
+    Undated, because a window whose files the catalogue has lost must still find
+    the folder they are in.
+
+    Args:
+        where_clause (str): The query's clause, without its collection dates.
+
+    Returns:
+        dict[str, dict]: For each folder, the ``keys`` the catalogue holds in it
+        and the ``fields`` a record of a file it lacks takes from its neighbours.
+    """
+    rows = _fetch_all_pages({
+        "f": "json",
+        "where": where_clause,
+        "outFields": "CLOUD_PATH,DATASET_NAME,CRUISE_NAME",
+        "returnGeometry": "false",
+        "orderByFields": "FILE_NAME",
+    })
+    folders = {}
+    for row in rows:
+        cloud_path = row.get("CLOUD_PATH") or ""
+        if not cloud_path.startswith(_S3_BUCKET_PREFIX):
+            continue
+        folder = folders.setdefault(_archive_folder(cloud_path), {
+            "keys": set(),
+            "fields": {
+                "DATASET_NAME": row.get("DATASET_NAME"),
+                "CRUISE_NAME": row.get("CRUISE_NAME"),
+            },
+        })
+        folder["keys"].add(_archive_key(cloud_path))
+    return folders
+
+
+def _in_collection_range(key, start):
+    """Whether a file could be a catalogue candidate for a window from *start*.
+
+    Mirrors the collection date clause query_ncei_data derives, so a file before
+    a long recording gap is not kept for seeming to record across the gap.
+    """
+    if start is None:
+        return True
+    stamp = parse_datetime_from_filename(_path_basename(key))
+    return stamp is None or stamp.date() >= (start - timedelta(days=1)).date()
+
+
+def _record_from_listing(key, fields):
+    """A record for a file the archive holds and the catalogue does not."""
+    name = _path_basename(key)
+    return {
+        "FILE_NAME": f"{name}.raw",
+        "CLOUD_PATH": key,
+        "FILE_DATETIME": parse_datetime_from_filename(name),
+        **fields,
+    }
+
+
+def _comparison_failure(exc):
+    """The error for a query that cannot check its result against the archive."""
+    return RuntimeError(
+        "Could not compare NCEI's catalogue with the archive's own listing, so the "
+        f"file list may be incomplete: {exc}. Run again, or set listing='catalog' to "
+        "use the catalogue alone."
+    )
+
+
+def _use_bucket_listing(items, catalogued, where_clause, start, end, listing):
+    """Take each folder's files from the archive where the catalogue disagrees.
+
+    The listing replaces the folder's records rather than adding to them: a file's
+    end is inferred from the next listed file, so a catalogue with gaps also keeps
+    files that do not reach the window.
+
+    Args:
+        items (list[dict]): The catalogue's records after the time window.
+        catalogued (list[dict]): Its records before the window, for their metadata.
+        where_clause (str): The query's clause, without its collection dates.
+        start (datetime | None): Start of the time window.
+        end (datetime | None): End of the time window.
+        listing (str): ``"auto"`` or ``"bucket"``.
+
+    Returns:
+        list[dict]: The records to use, the catalogue's own wherever it has the file.
+
+    Raises:
+        ValueError: In ``"bucket"`` mode, if no folder holds raw files.
+        RuntimeError: If the catalogue or the bucket cannot be read. Going on would
+            checkpoint a possibly short list under the step's normal hash.
+    """
+    by_key = {
+        _archive_key(item["CLOUD_PATH"]): item
+        for item in catalogued
+        if item.get("CLOUD_PATH")
+    }
+    read_any = False
+    try:
+        folders = _catalogued_folders(where_clause)
+        if not folders and listing == "auto":
+            print(_NO_FOLDER_WARNING)
+        for folder, info in folders.items():
+            keys = _list_bucket_raw_files(folder)
+            # Metadata folders hold no raw files, and some cruises are stored as
+            # .tar. Those stay as the catalogue has them.
+            if not keys:
+                continue
+            if listing == "auto" and not info["keys"] & set(keys):
+                print(
+                    f"Warning: the catalogue and the archive's own listing share no "
+                    f"files in {folder}; keeping the catalogue's."
+                )
+                continue
+            read_any = True
+            wanted = filter_paths_by_file_time(
+                [key for key in keys if _in_collection_range(key, start)],
+                start,
+                end,
+                verify_boundary=False,
+            )
+            in_folder = lambda item: _archive_folder(item.get("CLOUD_PATH") or "") == folder
+            found = [item for item in items if in_folder(item)]
+            if {_archive_key(item["CLOUD_PATH"]) for item in found} == set(wanted):
+                continue
+            unlisted = len(info["keys"] - set(keys))
+            print(
+                f"Warning: NCEI's catalogue gives {len(found)} raw file(s) in {folder} "
+                f"for this window and the archive's own listing gives {len(wanted)}; "
+                "using the listing. Files the catalogue lacks carry no catalogue "
+                "metadata."
+                + (f" {unlisted} file(s) the catalogue lists are not in it." if unlisted else "")
+            )
+            items = [item for item in items if not in_folder(item)] + [
+                by_key.get(key) or _record_from_listing(key, info["fields"])
+                for key in wanted
+            ]
+    except (requests.exceptions.RequestException, ET.ParseError) as exc:
+        raise _comparison_failure(exc) from exc
+    if listing == "bucket" and not read_any:
+        raise ValueError(
+            "listing='bucket' found no raw files for this query: the catalogue names "
+            "no S3 folder holding any"
+        )
+    return items
+
+
+def _warn_if_catalogue_short(where_clause, per_file_filters):
+    """Say when a query the listing cannot answer rests on an incomplete catalogue."""
+    try:
+        folders = _catalogued_folders(where_clause)
+        if not folders:
+            print(_NO_FOLDER_WARNING)
+        for folder, info in folders.items():
+            keys = set(_list_bucket_raw_files(folder))
+            indexed = info["keys"] & keys
+            if indexed and indexed != keys:
+                print(
+                    f"Warning: NCEI's catalogue indexes {len(indexed)} of the "
+                    f"{len(keys)} raw files in {folder}, so this filtered query may be "
+                    f"missing files. Remove the per-file filters "
+                    f"({', '.join(per_file_filters)}) to use the archive's own listing."
+                )
+    except (requests.exceptions.RequestException, ET.ParseError) as exc:
+        print(f"Warning: could not compare the NCEI catalogue with the archive: {exc}")
 
 
 def _extract_tar(tar_path, output_dir):
@@ -737,6 +981,7 @@ def query_ncei_data(
     filters=None,
     return_geometry=True,
     file_names=None,
+    listing="auto",
 ):
     """Query the NOAA NCEI Water Column Sonar Data (WCSD) archive.
 
@@ -797,6 +1042,24 @@ def query_ncei_data(
             order. A name with no stamp, or one the query did not return,
             raises rather than silently shrinking the result. ``None`` or
             empty keeps everything.
+        listing (str): How to use the archive's own file listing, since the
+            catalogue can lack files the archive holds. ``"auto"`` compares
+            them and, where they disagree, takes that S3 folder's files from
+            the listing with a printed warning. ``"catalog"`` never reads the
+            archive. ``"bucket"`` always takes raw files from the listing. In
+            ``"auto"`` and ``"bucket"``, a catalogue or archive that cannot be
+            read raises ``RuntimeError`` rather than return a list that may be
+            short, which a checkpoint would keep under the step's normal hash;
+            ``"catalog"`` is the way through an archive outage. A listing
+            knows only file names, so it needs
+            a query naming a cruise or dataset (``dataset_name``, or
+            ``CRUISE_NAME`` or ``DATASET_NAME`` in *filters*) and no per-file
+            filter (*frequencies*, *calibration_state*, a spatial filter,
+            explicit collection dates, or other *filters* keys). A query with
+            one comes from the catalogue alone: ``"auto"`` warns if the
+            catalogue is short for the cruise and ``"bucket"`` raises. A file
+            taken from the listing has a minimal record, with no ``GEOMETRY``
+            or other catalogue attributes.
 
     Returns:
         dict: A dict with two keys:
@@ -824,6 +1087,31 @@ def query_ncei_data(
         records = result["records"]
         label = result["query_label"]
     """
+    if listing not in _LISTING_MODES:
+        raise ValueError(f"listing must be one of {_LISTING_MODES}, got {listing!r}")
+
+    given_filters = filters or {}
+    named_cruise = dataset_name is not None or bool(_CRUISE_SCOPE_FIELDS & set(given_filters))
+    folder_filters = {k: v for k, v in given_filters.items() if k in _FOLDER_LEVEL_FIELDS}
+    per_file_filters = [
+        name
+        for name, value in (
+            ("frequencies", frequencies),
+            ("calibration_state", calibration_state),
+            ("collection_start", collection_start),
+            ("collection_end", collection_end),
+            ("bbox", bbox),
+            ("center_point", center_point),
+        )
+        if value not in (None, [])
+    ] + [key for key in given_filters if key not in _FOLDER_LEVEL_FIELDS]
+    if listing == "bucket" and (per_file_filters or not named_cruise):
+        raise ValueError(
+            "listing='bucket' needs a query naming a cruise or dataset and no "
+            "per-file filter, because the archive's listing knows only file names; "
+            f"got per-file filters {per_file_filters}"
+        )
+
     query_label = build_query_label(
         dataset_name=dataset_name,
         instrument_type=instrument_type,
@@ -886,6 +1174,8 @@ def query_ncei_data(
     try:
         items = _fetch_all_pages(params)
     except requests.exceptions.RequestException as exc:
+        if listing != "catalog" and named_cruise:
+            raise _comparison_failure(exc) from exc
         print(f"Network error: {exc}")
         return {"records": [], "query_label": query_label, "raw_urls": []}
 
@@ -894,6 +1184,7 @@ def query_ncei_data(
         item["FILE_DATETIME"] = _parse_datetime_from_filename(
             item.get("FILE_NAME", "")
         )
+    catalogued = items
 
     # Fine-grained filename-time filtering (overlap semantics: a file's end
     # time is inferred from the next file's start stamp)
@@ -928,6 +1219,24 @@ def query_ncei_data(
             f"  Filename-time filter: {before} -> {len(items)} results "
             f"({file_time_start} to {file_time_end})"
         )
+
+    if listing != "catalog" and named_cruise:
+        folder_clause = _build_where_clause(
+            dataset_name=dataset_name,
+            instrument_type=instrument_type,
+            filters=folder_filters,
+        )
+        if per_file_filters:
+            _warn_if_catalogue_short(folder_clause, per_file_filters)
+        else:
+            items = _use_bucket_listing(
+                items,
+                catalogued,
+                folder_clause,
+                _coerce_datetime(file_time_start),
+                _coerce_datetime(file_time_end),
+                listing,
+            )
 
     if file_names:
         items = _keep_named_files(items, file_names)
