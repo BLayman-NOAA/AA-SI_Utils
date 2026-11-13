@@ -27,6 +27,7 @@ from aa_si_utils import _storage
 from aa_si_utils.data_retrieval import (
     filter_evl_paths_by_file_time,
     filter_paths_by_file_time,
+    parse_datetime_from_filename,
     parse_evl_span_from_filename,
 )
 
@@ -44,6 +45,10 @@ DEFAULT_PING_TIME_CHUNK = 1000
 # Depth Echoview writes into a line file for a ping where no bottom was found.
 # Treated as a hole in the line rather than a 10 km deep seafloor.
 ECHOVIEW_NAN_DEPTH_VALUE = -10000.99
+
+# Variable recording how many pings each time bin of a binned product holds.
+# A fan-in weights a bin split across two segments by it.
+PING_COUNT_VAR = "ping_count"
 
 
 def _computed_values(data):
@@ -288,6 +293,225 @@ def mask_sparse_bins(ds_Sv: xr.Dataset,
 
     keep_mask = xr.DataArray(keep, dims=sv.dims, coords=sv.coords)
     return ds_Sv.assign(Sv=sv.where(keep_mask))
+
+
+def _count_pings_per_bin(ping_times, bin_starts, closed="left"):
+    """Count the pings that fall in each time bin.
+
+    Args:
+        ping_times: Ping times of the data that was binned.
+        bin_starts: Start of each bin, sorted, with no gaps between bins.
+        closed: Which side of each bin is closed, ``"left"`` or ``"right"``.
+
+    Returns:
+        np.ndarray: Integer ping count per bin.
+    """
+    side = "right" if closed == "left" else "left"
+    bin_index = np.searchsorted(bin_starts, ping_times, side=side) - 1
+    return np.bincount(bin_index[bin_index >= 0], minlength=len(bin_starts))
+
+
+def compute_mvbs(ds_Sv: xr.Dataset,
+                 range_var: str = "echo_range",
+                 range_bin: str = "20m",
+                 ping_time_bin: str = "20s",
+                 method: str = "map-reduce",
+                 reindex: bool = False,
+                 skipna: bool = True,
+                 fill_value: float = np.nan,
+                 closed: str = "left",
+                 range_var_max: str | None = None) -> xr.Dataset:
+    """Compute MVBS and record how many pings each time bin holds.
+
+    The binning and averaging are ``echopype.commongrid.compute_MVBS``, with
+    the same arguments.  The result also carries ``ping_count`` along
+    ``ping_time``.  When MVBS is computed per file, a file boundary inside a
+    time bin makes both files emit that bin, and :func:`concat_datasets` uses
+    the count to weight the two parts by the pings each one averaged.
+
+    Args:
+        ds_Sv: Sv dataset to average.
+        range_var: Variable to bin along, ``"echo_range"`` or ``"depth"``.
+        range_bin: Range bin size as a string (e.g. ``"2m"``).
+        ping_time_bin: Time bin size as a string (e.g. ``"10s"``).
+        method: Flox reduction strategy for dask arrays.
+        reindex: Reindex at the blockwise stage rather than after it.
+        skipna: Skip NaN values when averaging.
+        fill_value: Value for bins holding no data.
+        closed: Which side of each bin is closed, ``"left"`` or ``"right"``.
+        range_var_max: Deepest value the bins cover (e.g. ``"1810m"``).  None
+            reads it from the data, which computes a lazy dataset.
+
+    Returns:
+        xr.Dataset: MVBS dataset with ``ping_count`` added.
+    """
+    ds_MVBS = ep.commongrid.compute_MVBS(
+        ds_Sv,
+        range_var=range_var,
+        range_bin=range_bin,
+        ping_time_bin=ping_time_bin,
+        method=method,
+        reindex=reindex,
+        skipna=skipna,
+        fill_value=fill_value,
+        closed=closed,
+        range_var_max=range_var_max,
+    )
+    counts = _count_pings_per_bin(
+        ds_Sv["ping_time"].values, ds_MVBS["ping_time"].values, closed
+    )
+    ds_MVBS[PING_COUNT_VAR] = (
+        "ping_time", counts, {"long_name": "Number of pings in the time bin"}
+    )
+    return ds_MVBS
+
+
+def add_location(ds_Sv: xr.Dataset,
+                 echodata,
+                 nmea_sentence: str | None = None,
+                 datagram_type: str | None = None,
+                 missing: str = "nan") -> xr.Dataset:
+    """Add latitude and longitude at each ping from the raw file's position data.
+
+    ``echopype.consolidate.add_location`` interpolates the platform's position
+    fixes onto ``ping_time``. Repeated fix times are dropped first, keeping the
+    first, as echodataflow's raw to Sv flow does; this replaces the EchoData's
+    ``Platform`` group with the deduplicated one.
+
+    A file with no usable fixes, which echopype rejects, gets ``latitude`` and
+    ``longitude`` filled with NaN and a warning when ``missing`` is ``"nan"``,
+    so a survey merged from files with and without position still lines up.
+
+    Args:
+        ds_Sv: Sv dataset to add position to.
+        echodata: The raw file's EchoData.
+        nmea_sentence: NMEA sentence type to take fixes from, such as ``"GGA"``.
+            None uses every sentence type the file recorded.
+        datagram_type: EK datagram to take position from, ``"MRU1"`` or
+            ``"IDX"``. None uses the NMEA fixes.
+        missing: ``"nan"`` to fill a file without fixes with NaN, or
+            ``"error"`` to raise as echopype does.
+
+    Returns:
+        xr.Dataset: ``ds_Sv`` with ``latitude`` and ``longitude`` along
+        ``ping_time``.
+
+    Raises:
+        ValueError: If ``missing`` is not ``"nan"`` or ``"error"``, or if the file
+            has no fixes and ``missing`` is ``"error"``.
+    """
+    if missing not in ("nan", "error"):
+        raise ValueError(f"missing must be 'nan' or 'error', got {missing!r}")
+
+    suffix = f"_{datagram_type.lower()}" if datagram_type in ("MRU1", "IDX") else ""
+    platform = echodata["Platform"]
+    latitude = platform.get(f"latitude{suffix}")
+    has_fixes = latitude is not None and bool(latitude.notnull().any())
+    if not has_fixes:
+        if missing == "error":
+            raise ValueError("The raw file has no position fixes to add.")
+        logger.warning(
+            "No position fixes in the raw file; latitude and longitude are NaN."
+        )
+        empty = np.full(ds_Sv.sizes["ping_time"], np.nan)
+        return ds_Sv.assign(
+            latitude=("ping_time", empty,
+                      {"long_name": "Latitude", "units": "degrees_north"}),
+            longitude=("ping_time", empty.copy(),
+                       {"long_name": "Longitude", "units": "degrees_east"}),
+        )
+
+    time_dim = latitude.dims[0]
+    if not pd.Index(platform[time_dim].values).is_unique:
+        echodata["Platform"] = platform.drop_duplicates(time_dim)
+    return ep.consolidate.add_location(
+        ds_Sv, echodata, datagram_type=datagram_type, nmea_sentence=nmea_sentence
+    )
+
+
+def plan_time_windows(raw_file_paths,
+                      window_mins: int = 20,
+                      no_data_gap_hours: float = 3.0,
+                      label_format: str = "%Y%m%dT%H%M%S") -> dict:
+    """Plan clock aligned time windows over a set of raw files.
+
+    Each file's start time is read from the ``D{YYYYMMDD}-T{HHMMSS}`` pattern
+    in its name. Windows are ``window_mins`` long, aligned to the clock in UTC,
+    and run from the window holding the first file to the window holding the
+    last one. This is how echodataflow's MVBS postprocessing flow plans its
+    slices, so a step mapped over the result reproduces them.
+
+    A window whose most recent file started more than ``no_data_gap_hours``
+    before it is a recording gap and is left out. Windows inside shorter gaps
+    are kept and come back empty from :func:`select_ping_time_range` with
+    ``allow_empty``.
+
+    Args:
+        raw_file_paths: Raw file paths or names.
+        window_mins: Window length in minutes.
+        no_data_gap_hours: Longest time since the last file started for a
+            window to still be planned.
+        label_format: ``strftime`` format of each window's label.
+
+    Returns:
+        dict: ``{"windows": [...]}``. Each window is a dict with ``start`` (ISO
+        string, inclusive), ``end`` (ISO string, the last nanosecond before the
+        next window, so the pair is half open as a selection), ``label``, and
+        ``raw_filenames``: the files starting inside the window plus the last
+        one starting before it, which may still be recording.
+
+    Raises:
+        ValueError: If no file name carries a start time, if ``window_mins`` is
+            not positive, or if ``no_data_gap_hours`` is not positive.
+    """
+    if window_mins <= 0:
+        raise ValueError("window_mins must be greater than zero")
+    if no_data_gap_hours <= 0:
+        raise ValueError("no_data_gap_hours must be greater than zero")
+
+    starts = []
+    unparsed = []
+    for path in raw_file_paths:
+        name = Path(str(path)).name
+        stamp = parse_datetime_from_filename(name)
+        if stamp is None:
+            unparsed.append(name)
+        else:
+            starts.append((pd.Timestamp(stamp), name))
+    if unparsed:
+        raise ValueError(f"No start time in raw file names: {unparsed}")
+    if not starts:
+        raise ValueError("plan_time_windows received no raw files")
+    starts.sort()
+
+    duration = pd.Timedelta(minutes=window_mins)
+    freq = f"{window_mins}min"
+    window_start = starts[0][0].floor(freq)
+    final_end = starts[-1][0].floor(freq) + duration
+    gap = pd.Timedelta(hours=no_data_gap_hours)
+
+    windows = []
+    first = 0
+    while window_start + duration <= final_end:
+        window_end = window_start + duration
+        # starts is sorted, so one index walks forward through the windows:
+        # the files inside run from `first` up to the first start past the end.
+        while first < len(starts) and starts[first][0] < window_start:
+            first += 1
+        last = first
+        while last < len(starts) and starts[last][0] < window_end:
+            last += 1
+        # Plus the last file starting before the window, which may still record.
+        files = starts[max(first - 1, 0):last]
+        if window_start - files[-1][0] <= gap:
+            windows.append({
+                "start": window_start.isoformat(),
+                "end": (window_end - pd.Timedelta(1, "ns")).isoformat(),
+                "label": window_start.strftime(label_format),
+                "raw_filenames": [name for _, name in files],
+            })
+        window_start = window_end
+    return {"windows": windows}
 
 
 def select_ping_time_range(ds_Sv: xr.Dataset,
@@ -2534,14 +2758,18 @@ def _resolve_intermediate_dir() -> tuple[Path | str, dict | None]:
 
     When running inside the recipe executor the directory is read from
     ``ExecutionContext.temp_dir`` (set to ``exe_temp/``) and the stores are
-    written under ``<temp_dir>/data/``.  Falls back to a sub-directory of the
-    OS temp folder when called standalone (e.g. in a plain script or notebook).
+    written under ``<temp_dir>/data/``.  Outside the executor, for example in
+    a generated echodataflow flow, the ``AA_SI_UTILS_TEMP_DIR`` environment
+    variable names the scratch folder.  Without either it falls back to a
+    sub-directory of the OS temp folder.
 
     Returns a ``(data_dir, storage_options)`` pair where ``data_dir`` is a
     local ``Path`` or, for a ``gs://`` scratch dir, a URL string.
     """
     import tempfile
     temp_dir = _execution_temp_dir()
+    if temp_dir is None:
+        temp_dir = os.environ.get("AA_SI_UTILS_TEMP_DIR") or None
     if temp_dir is not None:
         return _storage.join(temp_dir, "data"), _storage.storage_options_of(temp_dir)
     return Path(tempfile.gettempdir()) / "aa_si_utils_temp" / "data", None
@@ -3290,6 +3518,45 @@ def _restore_provenance_vars(merged, items, dim):
     return merged
 
 
+def _weighted_group_mean(da, weights, dim):
+    """Average entries of *da* sharing a label on *dim*, weighted by *weights*.
+
+    A NaN entry carries no weight, so it does not dilute the entries it shares
+    a label with.
+
+    Args:
+        da: DataArray with *dim* among its dimensions.
+        weights: DataArray along *dim* alone, one weight per entry.
+        dim: Dimension holding the repeated labels.
+
+    Returns:
+        xr.DataArray: *da* with one entry per label, NaN where no entry sharing
+        the label held both a value and a positive weight.
+    """
+    valid = weights.where(da.notnull())
+    total = valid.groupby(dim).sum(dim)
+    summed = (da * valid).groupby(dim).sum(dim)
+    return (summed / total.where(total > 0)).transpose(*da.dims)
+
+
+def _drop_partial_ping_count(items):
+    """Drop the ping count unless every segment carries it.
+
+    Segments loaded from checkpoints written before the count existed do not
+    have it. Concatenating a mix would leave gaps in the count, so the merge
+    falls back to the unweighted average for all of them.
+    """
+    carrying = sum(PING_COUNT_VAR in ds.variables for ds in items)
+    if carrying in (0, len(items)):
+        return items
+    logger.warning(
+        "%d of %d segments carry %s, so duplicated bins are averaged "
+        "unweighted. Recompute the per-segment step to weight them.",
+        carrying, len(items), PING_COUNT_VAR,
+    )
+    return [ds.drop_vars(PING_COUNT_VAR, errors="ignore") for ds in items]
+
+
 def _combine_duplicate_labels(ds, dim):
     """Average entries sharing a label on *dim* into one.
 
@@ -3302,22 +3569,39 @@ def _combine_duplicate_labels(ds, dim):
 
     Variables carrying ``units: dB`` are averaged in the linear domain and
     converted back, since a mean of decibels is not the mean of what they
-    measure. Everything else is averaged arithmetically. The average is
-    unweighted: the partial bins do not record how many pings each contributed,
-    so a boundary bin is biased toward whichever side held fewer.
+    measure. Everything else is averaged arithmetically.
+
+    When the dataset carries ``ping_count`` along *dim*, each entry is weighted
+    by it, so a bin split 2 pings to 8 comes out as the mean of all 10, and the
+    merged entry's count is the sum. The weighting is exact where both parts
+    hold the same number of valid samples per ping and close where masking
+    differs between them. Without the count the average is unweighted and a
+    boundary bin is biased toward whichever side held fewer pings.
 
     Variables without *dim* are carried through untouched.
     """
     if dim not in ds.indexes or ds.indexes[dim].is_unique:
         return ds
 
+    weights = None
+    if PING_COUNT_VAR in ds.data_vars and ds[PING_COUNT_VAR].dims == (dim,):
+        weights = ds[PING_COUNT_VAR]
+
     combined = {}
     for name, da in ds.data_vars.items():
         if dim not in da.dims:
             continue
+        if weights is not None and name == PING_COUNT_VAR:
+            rolled = da.groupby(dim).sum(dim)
+            rolled.attrs = dict(da.attrs)
+            combined[name] = rolled
+            continue
         in_db = str(da.attrs.get("units", "")).lower() == "db"
         work = 10.0 ** (da / 10.0) if in_db else da
-        rolled = work.groupby(dim).mean(dim)
+        if weights is None:
+            rolled = work.groupby(dim).mean(dim)
+        else:
+            rolled = _weighted_group_mean(work, weights, dim)
         if in_db:
             rolled = 10.0 * np.log10(rolled)
         rolled.attrs = dict(da.attrs)
@@ -3397,7 +3681,8 @@ def concat_datasets(datasets, dim="ping_time", on_duplicate=None,
         on_duplicate: What to do when segments share a label on *dim*.
             ``None`` (default) leaves them, which is right when the segments
             cannot overlap. ``"mean"`` averages them into one entry, which is
-            what a fan-in over per-segment *binned* products needs: see
+            what a fan-in over per-segment *binned* products needs, weighted
+            by ``ping_count`` when every segment carries it: see
             :func:`_combine_duplicate_labels`. ``"first"`` keeps the first and
             sorts, which is what a fan-in over overlapping *slices of one
             store* needs: see :func:`_drop_duplicate_labels`.
@@ -3418,6 +3703,7 @@ def concat_datasets(datasets, dim="ping_time", on_duplicate=None,
     if len(items) == 1:
         return items[0]
     if isinstance(items[0], xr.Dataset):
+        items = _drop_partial_ping_count(items)
         concat_kwargs = {
             "data_vars": "minimal",
             "coords": "minimal",

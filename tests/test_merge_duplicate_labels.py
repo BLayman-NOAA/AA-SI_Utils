@@ -23,13 +23,16 @@ from aa_si_utils.utils import concat_datasets
 T0 = np.datetime64("2016-06-27T00:00:00")
 
 
-def _segment(bins, sv_db, cv=None):
+def _segment(bins, sv_db, cv=None, pings=None):
     """One segment's binned product, labelled at 10 s bin edges."""
     t = T0 + np.array(bins) * np.timedelta64(10, "s")
     data = {"Sv": (("channel", "ping_time"), np.array([sv_db], dtype=float),
                    {"units": "dB", "long_name": "MVBS"})}
     if cv is not None:
         data["cell_cv"] = (("channel", "ping_time"), np.array([cv], dtype=float))
+    if pings is not None:
+        data["ping_count"] = ("ping_time", np.array(pings, dtype=np.int64),
+                              {"long_name": "Number of pings in the time bin"})
     return xr.Dataset(data, coords={"channel": ["ch0"], "ping_time": t})
 
 
@@ -121,6 +124,84 @@ def test_an_unknown_policy_is_rejected():
     with pytest.raises(ValueError, match="on_duplicate"):
         concat_datasets([_segment([4], [-80.0]), _segment([5], [-70.0])],
                         dim="ping_time", on_duplicate="median")
+
+
+def test_ping_count_weights_the_shared_label():
+    """A bin split 2 pings to 8 comes out as the mean of all 10 pings."""
+    merged = concat_datasets(
+        [_segment([4, 5], [-80.0, -70.0], cv=[0.1, 0.2], pings=[10, 2]),
+         _segment([5, 6], [-60.0, -50.0], cv=[0.4, 0.6], pings=[8, 10])],
+        dim="ping_time", on_duplicate="mean")
+
+    expected = 10 * np.log10((2 * 10 ** (-70 / 10) + 8 * 10 ** (-60 / 10)) / 10)
+    assert _at(merged, "Sv", 5) == pytest.approx(expected)
+    assert _at(merged, "cell_cv", 5) == pytest.approx((2 * 0.2 + 8 * 0.4) / 10)
+    assert _at(merged, "Sv", 4) == pytest.approx(-80.0)
+    assert merged["Sv"].dims == ("channel", "ping_time")
+
+
+def test_ping_counts_are_summed_and_stay_integer():
+    merged = concat_datasets(
+        [_segment([4, 5], [-80.0, -70.0], pings=[10, 2]),
+         _segment([5, 6], [-60.0, -50.0], pings=[8, 10])],
+        dim="ping_time", on_duplicate="mean")
+
+    assert list(merged["ping_count"].values) == [10, 10, 10]
+    assert merged["ping_count"].dtype.kind == "i"
+    assert merged["ping_count"].attrs["long_name"].startswith("Number of pings")
+
+
+def test_a_nan_part_carries_no_weight():
+    """A part with no valid samples must not dilute or blank the other part."""
+    merged = concat_datasets(
+        [_segment([4, 5], [-80.0, np.nan], pings=[10, 2]),
+         _segment([5, 6], [-60.0, -50.0], pings=[8, 10])],
+        dim="ping_time", on_duplicate="mean")
+
+    assert _at(merged, "Sv", 5) == pytest.approx(-60.0)
+
+
+def test_a_label_with_no_valid_part_stays_nan():
+    merged = concat_datasets(
+        [_segment([4, 5], [-80.0, np.nan], pings=[10, 2]),
+         _segment([5, 6], [np.nan, -50.0], pings=[8, 10])],
+        dim="ping_time", on_duplicate="mean")
+
+    assert np.isnan(_at(merged, "Sv", 5))
+
+
+def test_a_partial_ping_count_falls_back_to_the_unweighted_mean(caplog):
+    """Segments without the count cannot be weighted, so none are."""
+    with caplog.at_level("WARNING", logger="aa_si_utils.utils"):
+        merged = concat_datasets(
+            [_segment([4, 5], [-80.0, -70.0], pings=[10, 2]),
+             _segment([5, 6], [-60.0, -50.0])],
+            dim="ping_time", on_duplicate="mean")
+
+    expected = 10 * np.log10((10 ** (-70 / 10) + 10 ** (-60 / 10)) / 2)
+    assert _at(merged, "Sv", 5) == pytest.approx(expected)
+    assert "ping_count" not in merged
+    assert "unweighted" in caplog.text
+
+
+def test_ping_count_survives_a_merge_without_duplicates():
+    merged = concat_datasets(
+        [_segment([4, 5], [-80.0, -70.0], pings=[10, 10]),
+         _segment([6, 7], [-60.0, -50.0], pings=[10, 4])],
+        dim="ping_time", on_duplicate="mean")
+
+    assert list(merged["ping_count"].values) == [10, 10, 10, 4]
+
+
+def test_the_weighted_mean_stays_lazy():
+    a = _segment([4, 5], [-80.0, -70.0], pings=[10, 2]).chunk()
+    b = _segment([5, 6], [-60.0, -50.0], pings=[8, 10]).chunk()
+
+    merged = concat_datasets([a, b], dim="ping_time", on_duplicate="mean")
+
+    assert merged["Sv"].chunks is not None
+    expected = 10 * np.log10((2 * 10 ** (-70 / 10) + 8 * 10 ** (-60 / 10)) / 10)
+    assert _at(merged, "Sv", 5) == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
